@@ -498,3 +498,23 @@ def test_model_with_no_documented_columns_still_lists_database_columns(evaluator
     assert [c["name"] for c in batch["columns"]] == ["a", "b"]
     result = evaluator.submit(details, [], db_columns=db("a", "b"))
     assert result["summary"] == {"ok": 0, "rewrite": 0, "missing": 2}
+
+
+# ── upstream context in the batch ─────────────────────────────────────────
+
+
+def test_batch_carries_the_upstream_context_and_explains_it(evaluator):
+    upstream = {
+        "col_0": {"parent": "stg_x", "kind": "transformed", "built_by": {"expression": "upper(a)"}}
+    }
+    batch = evaluator.next_batch(make_details(2), upstream=upstream)
+    by_name = {c["name"]: c for c in batch["columns"]}
+    assert by_name["col_0"]["upstream"]["parent"] == "stg_x"
+    assert "upstream" not in by_name["col_1"]
+    assert "'upstream'" in batch["instructions"] and "built_by" in batch["instructions"]
+
+
+def test_batch_without_upstream_keeps_the_instructions_short(evaluator):
+    batch = evaluator.next_batch(make_details(2))
+    assert all("upstream" not in c for c in batch["columns"])
+    assert "'upstream'" not in batch["instructions"]

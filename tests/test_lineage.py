@@ -530,3 +530,98 @@ def test_columns_over_a_source_can_be_written_freely(store):
         "customer_name": "New",
     }
     assert report == {"copied": [], "skipped": [], "rejected": []}
+
+
+# ── upstream context for the evaluation ───────────────────────────────────
+
+
+def test_upstream_context_describes_how_each_column_is_built(store):
+    sql = (
+        "select id, status as state, upper(status) as status_up, cast(amount as bigint) as amount_n "
+        "from {{ ref('raw_orders') }} where amount > 0"
+    )
+    columns = {"id": "", "state": "", "status_up": "", "amount_n": "", "ghost": ""}
+    context = planner_for(altering_models(columns, sql), store).upstream_context("stg_filtered")
+    assert context["id"]["parent"] == "raw_orders" and context["id"]["kind"] == "passthrough"
+    assert context["id"]["parent_description"] == "Order identifier."
+    assert context["id"]["model_effects"] == ["where"]
+    assert (context["state"]["kind"], context["state"]["parent_column"]) == ("renamed", "status")
+    assert context["status_up"]["kind"] == "transformed"
+    assert context["status_up"]["built_by"] == {
+        "model": "stg_filtered",
+        "expression": "upper(status)",
+    }
+    assert context["amount_n"]["kind"] == "cast" and "built_by" not in context["amount_n"]
+    assert context["ghost"]["kind"] == "unknown"
+
+
+def test_upstream_context_finds_the_expression_further_up(store):
+    models = base_models() + [
+        {
+            "name": "stg_upper",
+            "sql": "select upper(status) as status from {{ ref('raw_orders') }}",
+            "columns": {"status": "Upper status."},
+            "parents": ["raw_orders"],
+            "folders": ["stg"],
+        },
+        {
+            "name": "silver_copy",
+            "sql": "select * from {{ ref('stg_upper') }}",
+            "columns": {"status": "Upper status."},
+            "parents": ["stg_upper"],
+            "folders": ["silver"],
+        },
+    ]
+    info = planner_for(models, store).upstream_context("silver_copy")["status"]
+    assert info["kind"] == "passthrough" and info["parent"] == "stg_upper"
+    assert info["built_by"] == {"model": "stg_upper", "expression": "upper(status)"}
+
+
+def test_upstream_context_is_empty_for_root_layers_and_flags_sources(store):
+    planner = planner_for(base_models(), store)
+    assert planner.upstream_context("raw_orders") == {}
+    models = [
+        {
+            "name": "stg_src",
+            "sql": "select id from {{ source('s', 't') }}",
+            "columns": {"id": "x"},
+            "folders": ["stg"],
+        }
+    ]
+    manifest = make_manifest(
+        *models, sources={"source.proj.s.t": {"columns": {"id": {"description": "src text"}}}}
+    )
+    manifest["nodes"]["model.proj.stg_src"]["depends_on"]["nodes"] = ["source.proj.s.t"]
+    info = LineagePlanner(LineageGraph(manifest), store, FP).upstream_context("stg_src")["id"]
+    assert info["parent_is_source"] is True and info["parent_description"] == "src text"
+
+
+def test_long_parent_descriptions_are_truncated(store):
+    models = base_models()
+    models[1]["columns"]["id"] = "x" * 1000
+    info = planner_for(models, store).upstream_context("silver_orders")["id"]
+    assert len(info["parent_description"]) == 400
+
+
+def test_upstream_context_lists_the_chain_so_renames_further_up_are_visible(store):
+    models = base_models() + [
+        {
+            "name": "stg_renamed",
+            "sql": "select status as state from {{ ref('raw_orders') }}",
+            "columns": {"state": "Order status."},
+            "parents": ["raw_orders"],
+            "folders": ["stg"],
+        },
+        {
+            "name": "silver_copy2",
+            "sql": "select * from {{ ref('stg_renamed') }}",
+            "columns": {"state": "Order status."},
+            "parents": ["stg_renamed"],
+            "folders": ["silver"],
+        },
+    ]
+    info = planner_for(models, store).upstream_context("silver_copy2")["state"]
+    assert info["chain"] == [
+        {"model": "stg_renamed", "column": "state", "kind": "renamed"},
+        {"model": "raw_orders", "column": "status", "kind": "root"},
+    ]

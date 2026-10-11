@@ -76,6 +76,15 @@ def _get_evaluator() -> DescriptionQualityEvaluator:
     )
 
 
+def _upstream(model_name: str) -> dict[str, dict] | None:
+    """Parent context for each column; the review still works if it cannot be built."""
+    try:
+        return _get_planner().upstream_context(model_name) or None
+    except Exception as exc:
+        logger.warning("Could not build the upstream context for %s: %s", model_name, exc)
+        return None
+
+
 def _get_planner() -> LineagePlanner:
     manifest = _get_manifest()
     state_dir = manifest.project_dir / "target" / "dbt_doctor"
@@ -211,7 +220,9 @@ def evaluate_model_descriptions(model_name: str, offset: int = 0) -> str:
     Prepare the next batch of columns of ONE model for a description-quality review.
 
     Read-only. Returns the model context, compiled SQL, deterministic signals per column
-    and a scoring rubric. When the database is connected it also describes the table, so
+    and a scoring rubric. Each column also carries its `upstream` context when it can be
+    read: the parent model and column, how it is built (passthrough, renamed, cast,
+    transformed), the parent's description and the expression that builds it. When the database is connected it also describes the table, so
     columns that exist there but are not documented in schema.yml are included (reported
     as 'missing', `declared: false`) and `database_check` says whether the check ran. You (the AI assistant) judge each column on each rubric question,
     then send the scores with `submit_description_scores`. Wide tables are split into
@@ -230,7 +241,9 @@ def evaluate_model_descriptions(model_name: str, offset: int = 0) -> str:
         return f"Model '{model_name}' not found. Run `list_models` to see available models."
     try:
         db_columns, db_note = _database_columns(details)
-        batch = _get_evaluator().next_batch(details, offset, db_columns=db_columns, db_note=db_note)
+        batch = _get_evaluator().next_batch(
+            details, offset, db_columns=db_columns, db_note=db_note, upstream=_upstream(model_name)
+        )
     except (RubricError, ValueError) as exc:
         return f"❌ {exc}"
     return json.dumps(batch, ensure_ascii=False)

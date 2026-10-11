@@ -203,3 +203,24 @@ def test_unknown_model_returns_a_readable_error(project):
     assert server.plan_description_updates("ghost").startswith("❌")
     assert server.trace_column_lineage("ghost", "id").startswith("❌")
     assert "not found" in server.update_model_yaml("ghost", "", [])
+
+
+def test_evaluation_batch_includes_the_parent_context(project):
+    batch = json.loads(server.evaluate_model_descriptions("silver_orders"))
+    cols = {c["name"]: c for c in batch["columns"]}
+    assert cols["id"]["upstream"]["parent"] == "raw_orders"
+    assert cols["id"]["upstream"]["parent_description"] == "Order identifier."
+    assert cols["status_up"]["upstream"]["built_by"]["expression"] == "upper(status)"
+    assert "built_by" in batch["instructions"]
+    root = json.loads(server.evaluate_model_descriptions("raw_orders"))
+    assert all("upstream" not in c for c in root["columns"])  # nothing above the root layer
+
+
+def test_evaluation_still_works_if_the_context_cannot_be_built(project, monkeypatch):
+    def broken():
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(server, "_get_planner", broken)
+    batch = json.loads(server.evaluate_model_descriptions("silver_orders"))
+    assert batch["model"] == "silver_orders"
+    assert all("upstream" not in c for c in batch["columns"])

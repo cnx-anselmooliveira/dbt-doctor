@@ -413,8 +413,13 @@ class DescriptionQualityEvaluator:
         max_chars: int = DEFAULT_BATCH_CHARS,
         db_columns: list[ColumnInfo] | None = None,
         db_note: str | None = None,
+        upstream: dict[str, dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
-        """Return the next batch of columns to judge, starting at ``offset``."""
+        """Return the next batch of columns to judge, starting at ``offset``.
+
+        ``upstream`` maps lower-case column names to their parent context (see
+        ``LineagePlanner.upstream_context``); it is attached to each column when present.
+        """
         model = details["name"]
         columns, database_check = merge_columns(details, db_columns, db_note)
         total = len(columns)
@@ -445,7 +450,7 @@ class DescriptionQualityEvaluator:
             },
             "offset": offset,
             "total_columns": total,
-            "instructions": self._instructions(model),
+            "instructions": self._instructions(model, bool(upstream)),
         }
         room = max_chars - len(json.dumps(header, ensure_ascii=False))
 
@@ -459,6 +464,8 @@ class DescriptionQualityEvaluator:
                 "tests": col.get("tests", []),
                 "signals": compute_signals(name, col.get("data_type"), col.get("description"), sql),
             }
+            if upstream and name.lower() in upstream:
+                entry["upstream"] = upstream[name.lower()]
             if col.get("in_database") is False:
                 entry["signals"]["not_in_database"] = True
             if not col.get("declared", True):
@@ -490,7 +497,7 @@ class DescriptionQualityEvaluator:
             return None, "omitted (too large); rely on 'complex_sql_expression' signals"
         return sql, kind
 
-    def _instructions(self, model: str) -> str:
+    def _instructions(self, model: str, with_upstream: bool = False) -> str:
         example_scores = {q.id: self.rubric.max_score_per_question for q in self.rubric.questions}
         example = json.dumps([{"column": "<name>", "scores": example_scores}])
         return (
@@ -499,7 +506,18 @@ class DescriptionQualityEvaluator:
             "the description, the SQL, the signals and the model context. Signals are hints, "
             "not scores. Only score; do not write or suggest descriptions. Columns with "
             "'status': 'missing' have an empty description and are recorded automatically, so "
-            "do not score them. Columns with 'declared': false exist in the table but are not "
+            "do not score them. "
+            + (
+                "Each column may carry 'upstream': its parent model and column, how it is built "
+                "('kind': passthrough, renamed, cast or transformed), the parent's description "
+                "and, when an expression builds it, 'built_by'. Use it: a copied or renamed "
+                "column should agree with its parent's description, and a transformed one "
+                "should explain the transformation shown in 'built_by' (and any 'model_effects' "
+                "such as filters). 'kind': 'unknown' means the lineage could not be read. "
+                if with_upstream
+                else ""
+            )
+            + "Columns with 'declared': false exist in the table but are not "
             "documented in schema.yml (database_check lists them). If database_check.status "
             "is 'unavailable', tell the user the columns could not be checked against the "
             "database. Then call "

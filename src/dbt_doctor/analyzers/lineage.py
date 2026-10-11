@@ -196,7 +196,7 @@ class LineageGraph:
                 if item.kind == "transformed":
                     source = self._source_of_expression(parent, item.expression, column)
                     return ColumnEdge(
-                        parent, source, "transformed", shape.effects, "high", item.expression[:200]
+                        parent, source, "transformed", shape.effects, "high", item.expression[:400]
                     )
                 return ColumnEdge(parent, item.source, item.kind, shape.effects, "high")
         if any(i.kind == "star" for i in shape.items):
@@ -209,6 +209,7 @@ class LineageGraph:
 # ═══════════════════════════════════════════════════════════════════════════
 
 _ACTIONS = ("copy", "write_new", "blocked", "keep")
+_PARENT_TEXT_LIMIT = 400
 
 
 class LineagePlanner:
@@ -406,6 +407,47 @@ class LineagePlanner:
             "totals": {a: totals.get(a, 0) for a in _ACTIONS},
             "models": rows,
         }
+
+    def upstream_context(self, name: str) -> dict[str, dict[str, Any]]:
+        """What the client needs to judge each column against its parent.
+
+        Keyed by lower-case column name. Root-layer models have no upstream and yield an
+        empty dict. Per column: the parent model and column, how it is built, the parent's
+        description and, when the column is built by an expression (here or further up),
+        that expression.
+        """
+        graph = self.graph
+        uid = self._resolve(name)
+        context: dict[str, dict[str, Any]] = {}
+        for column in graph.models[uid].columns:
+            edge = graph.edge(uid, column)
+            if edge is None:
+                continue
+            if edge.confidence == "low" or edge.parent is None:
+                context[column.lower()] = {"kind": "unknown", "why": edge.evidence}
+                continue
+            parent_model = graph.models.get(edge.parent)
+            parent_text = (graph.parent_description(edge.parent, edge.parent_column) or "").strip()
+            info: dict[str, Any] = {
+                "parent": parent_model.name if parent_model else edge.parent.split(".")[-1],
+                "parent_is_source": parent_model is None,
+                "parent_column": edge.parent_column,
+                "kind": edge.kind,
+                "parent_description": parent_text[:_PARENT_TEXT_LIMIT] or None,
+            }
+            if edge.effects:
+                info["model_effects"] = edge.effects
+            steps = self.trace(name, column)
+            built = next((s for s in steps if s.get("kind") == "transformed"), None)
+            if built:
+                info["built_by"] = {"model": built["model"], "expression": built.get("evidence")}
+            if len(steps) > 1:
+                info["chain"] = [
+                    {"model": s["model"], "column": s["column"], "kind": s.get("kind", "root")}
+                    for s in steps[1:]
+                ]
+            context[column.lower()] = info
+        return context
 
     def trace(self, name: str, column: str, max_depth: int = 25) -> list[dict[str, Any]]:
         graph = self.graph
