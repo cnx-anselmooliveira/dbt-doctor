@@ -37,6 +37,7 @@ class LayerMap:
     """
 
     def __init__(self, order: str = DEFAULT_LAYER_ORDER, root: str = DEFAULT_ROOT_LAYER) -> None:
+        self.order = order
         self.rank: dict[str, int] = {}
         for level, group in enumerate(order.split(",")):
             for label in group.split("|"):
