@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- `evaluate_model_descriptions` and `submit_description_scores` MCP tools: a description-quality review for one model at a time. The client LLM scores each column against an editable rubric (`description_rubric.json`, overridable with `--rubric-file`); dbt-doctor provides the context and deterministic hints, applies the pass threshold and returns the columns to rewrite with suggested descriptions. Wide tables are split into batches automatically. Read-only: nothing is written to the dbt project.
+- `evaluate_model_descriptions` and `submit_description_scores` MCP tools: a description-quality review for one model at a time. The client LLM scores each column against an editable rubric (`description_rubric.json`, overridable with `--rubric-file`); dbt-doctor provides the context and deterministic hints, applies the pass threshold and returns every column with its score in points and a status (`ok`, `rewrite` or `missing`). It only scores; it does not write or suggest descriptions. When the database is connected it also describes the table, so columns missing from `schema.yml` are reported too. Wide tables are split into batches automatically. Read-only: nothing is written to the dbt project.
 - `DescriptionQualityEvaluator` analyzer with tests.
 
 ## [0.1.0] - 2025-12-23
