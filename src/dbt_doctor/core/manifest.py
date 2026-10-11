@@ -8,6 +8,13 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
+def _relative_patch_path(value: str | None) -> str | None:
+    """``project://models\\a\\x.yaml`` -> ``models/a/x.yaml`` (project-relative, forward slashes)."""
+    if not value:
+        return None
+    return value.split("://", 1)[-1].replace("\\", "/")
+
+
 class ManifestCache:
     """Simple file-based cache that invalidates when file mtime changes."""
 
@@ -142,6 +149,7 @@ class DbtManifestParser:
                     "schema": node.get("schema"),
                     "alias": node.get("alias", node.get("name")),
                     "materialized": node.get("config", {}).get("materialized", "view"),
+                    "patch_path": _relative_patch_path(node.get("patch_path")),
                     "raw_sql": node.get("raw_code", node.get("raw_sql", "")),
                     "compiled_sql": node.get("compiled_code", node.get("compiled_sql", "")),
                     "columns": columns,

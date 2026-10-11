@@ -32,35 +32,46 @@ class YamlWriter:
     - Supports creating a new schema.yml if none exists.
     """
 
-    def __init__(self, project_dir: str) -> None:
+    def __init__(self, project_dir: str, schema_file_pattern: str = "{model}_schema.yaml") -> None:
         self.project_dir = Path(project_dir)
+        self.schema_file_pattern = schema_file_pattern
         self._yaml = _make_yaml()
 
-    def find_or_plan_schema_path(self, model_sql_path: str) -> Path:
+    def find_or_plan_schema_path(self, model_sql_path: str, patch_path: str | None = None) -> Path:
         """
-        Determine the schema.yml path for a model:
-        1. Look for _{model}.yml  → return if exists
-        2. Look for {model}.yml   → return if exists
-        3. Look for schema.yml in same dir → return if model is referenced inside
-        4. Plan to create _{model}.yml
+        Determine the YAML file that documents a model:
+        1. The file the manifest says already defines it (``patch_path``)
+        2. {pattern} (default {model}_schema.yaml), then the other usual names next to the
+           .sql: {model}_schema.yml, _{model}.yml, _{model}.yaml, {model}.yml, {model}.yaml
+        3. Any YAML file in the same folder that already defines the model
+        4. Otherwise plan a new file named after the pattern
         """
+        if patch_path and (self.project_dir / patch_path).exists():
+            return self.project_dir / patch_path
+
         abs_model = self.project_dir / model_sql_path
         model_dir = abs_model.parent
         stem = abs_model.stem
+        planned = model_dir / self.schema_file_pattern.format(model=stem)
 
         for candidate in [
+            planned,
+            model_dir / f"{stem}_schema.yaml",
+            model_dir / f"{stem}_schema.yml",
             model_dir / f"_{stem}.yml",
+            model_dir / f"_{stem}.yaml",
             model_dir / f"{stem}.yml",
+            model_dir / f"{stem}.yaml",
         ]:
             if candidate.exists():
                 return candidate
 
-        generic = model_dir / "schema.yml"
-        if generic.exists() and self._model_in_file(generic, stem):
-            return generic
+        if model_dir.is_dir():
+            for other in sorted([*model_dir.glob("*.yml"), *model_dir.glob("*.yaml")]):
+                if self._model_in_file(other, stem):
+                    return other
 
-        # Default: create dedicated file
-        return model_dir / f"_{stem}.yml"
+        return planned
 
     def _model_in_file(self, path: Path, model_name: str) -> bool:
         try:
@@ -91,6 +102,7 @@ class YamlWriter:
         columns: list[dict[str, Any]] | None = None,
         overwrite_descriptions: bool = False,
         dry_run: bool = False,
+        patch_path: str | None = None,
     ) -> dict[str, Any]:
         """
         Insert or update documentation for one model in its schema.yml.
@@ -111,13 +123,22 @@ class YamlWriter:
             merged additively.
         dry_run:
             Compute the changes without writing anything.
+        patch_path:
+            The project-relative file the manifest says already documents the model. It is
+            always the file that is updated; if it does not exist (stale manifest) nothing
+            is written, so a second definition of the model is never created.
 
         Returns
         -------
         dict with 'file_path' and 'changes' on success, or 'error' on failure. Each change
         is {'scope': 'model'|'column', 'column', 'old', 'new'}.
         """
-        yaml_path = self.find_or_plan_schema_path(model_sql_path)
+        if patch_path and not (self.project_dir / patch_path).exists():
+            return {
+                "error": f"The manifest says '{model_name}' is documented in {patch_path}, "
+                "but that file does not exist. Refresh the manifest with `dbt parse`."
+            }
+        yaml_path = self.find_or_plan_schema_path(model_sql_path, patch_path)
         data = self._load(yaml_path) or CommentedMap({"version": 2, "models": CommentedSeq()})
 
         if "models" not in data or data["models"] is None:

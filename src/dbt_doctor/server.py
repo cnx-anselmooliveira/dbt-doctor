@@ -61,6 +61,7 @@ _connector: BaseConnector | None = None
 _rubric_path: Path | None = None
 _layer_map: LayerMap = LayerMap()
 _casts_as_passthrough: bool = False
+_schema_file_pattern: str = "{model}_schema.yaml"
 _run_store_enabled: bool = True
 _run_store_path: Path | None = None
 _recorder: RunRecorder | None = None
@@ -1032,7 +1033,7 @@ def update_model_yaml(
             recorder.record_snapshot(model_name, _descriptions(details))
 
         project_dir = _manifest.project_dir if _manifest else Path(".")
-        writer = YamlWriter(str(project_dir))
+        writer = YamlWriter(str(project_dir), _schema_file_pattern)
 
         result = writer.upsert_model_yaml(
             model_name=model_name,
@@ -1041,6 +1042,7 @@ def update_model_yaml(
             columns=to_write,
             overwrite_descriptions=overwrite_descriptions,
             dry_run=dry_run,
+            patch_path=details.get("patch_path"),
         )
 
         if "error" in result:
@@ -1237,6 +1239,15 @@ def main() -> None:
     )
 
     arg_parser.add_argument(
+        "--schema-file-pattern",
+        type=str,
+        default="{model}_schema.yaml",
+        help=(
+            "Name of the YAML file created for a model that has none, next to its .sql "
+            "(default: %(default)s). A model already documented keeps its own file."
+        ),
+    )
+    arg_parser.add_argument(
         "--run-store",
         type=str,
         default=None,
@@ -1257,10 +1268,20 @@ def main() -> None:
     logging.getLogger().setLevel(getattr(logging, args.log_level))
 
     global _manifest, _connector, _rubric_path, _layer_map, _casts_as_passthrough
-    global _run_store_enabled, _run_store_path
+    global _run_store_enabled, _run_store_path, _schema_file_pattern
 
     _casts_as_passthrough = args.treat_casts_as_passthrough
     _run_store_enabled = not args.no_run_store
+    if (
+        "{model}" not in args.schema_file_pattern
+        or "/" in args.schema_file_pattern
+        or "\\" in args.schema_file_pattern
+        or not args.schema_file_pattern.endswith((".yaml", ".yml"))
+    ):
+        arg_parser.error(
+            "--schema-file-pattern must contain {model}, have no folder and end in .yaml or .yml."
+        )
+    _schema_file_pattern = args.schema_file_pattern
     _run_store_path = Path(args.run_store) if args.run_store else None
 
     try:
