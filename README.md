@@ -76,6 +76,20 @@ The same column often gets a different description in each layer even when nothi
 
 Work from the root layer (bronze) downwards: evaluate a model with `evaluate_model_descriptions`/`submit_description_scores`, run `plan_description_updates` on its children, write, then run `dbt parse` so the manifest reflects the new text. A description's score stops applying as soon as its text changes. Use `dry_run=True` to preview a write. The layer order (`--layer-order`, default `landing,bronze,stg,silver,intermediary,gold|view,az`) only labels and groups models; the dependency graph decides how descriptions propagate.
 
+### Run History
+Every tool of the documentation flow records what it does into a **run**, in a DuckDB file (`<project>/.dbt-doctor/dbt_doctor.duckdb`, with its own `.gitignore` so nothing reaches your repository). A run opens by itself on first use; `start_run` gives it a goal and a target model, and `start_run(resume=True)` continues the latest open one after a restart or after `dbt parse` changed the manifest.
+
+| Tool | What is recorded in the run |
+|---|---|
+| `evaluate_model_descriptions` | the batch served, the descriptions of the model at first contact, and the lineage edges it used |
+| `submit_description_scores` | the score of every question, the total and the status |
+| `plan_description_updates` | the decision per column (rule, action, verdict, reason, parent status) |
+| `update_model_yaml` | each change with the old and the new text, and what was copied, skipped or rejected (dry runs included, flagged) |
+
+Texts are stored once by hash, and scores are global: a score stays valid for any run as long as the description text and the rubric are the same. Use `get_run_report` to review a campaign, or query the file with DuckDB (`v_latest_scores` is the current score of each description).
+
+Recording never breaks a tool: if the file is locked by another process or unavailable, the tool still works, the result says `recording: unavailable (reason)`, and recording resumes a few seconds later. Options: `--run-store PATH` to move the file, `--no-run-store` to turn it off (scores then fall back to a JSON file under `target/dbt_doctor/`). An existing `description_scores.json` is imported once.
+
 ### End-to-End Documentation Generation
 Execute a complete workflow in a single conversational turn: profile a model, suggest tests, preview changes, and write to schema.yml.
 
@@ -96,6 +110,9 @@ Execute a complete workflow in a single conversational turn: profile a model, su
 | Lineage | `plan_description_updates` | For one model, which column descriptions must be copied from the parent, written anew, or are blocked |
 | Lineage | `trace_column_lineage` | Follows a column upstream through the layers |
 | Lineage | `check_description_consistency` | Paged overview of description consistency, parents before children |
+| History | `start_run` | Opens a run with a goal and a target model, or resumes the latest open one |
+| History | `get_run_report` | What a run did: events per tool, and per model the columns seen, scores, plan actions and writes |
+| History | `list_runs` | The recorded runs, newest first |
 | Profiling | `profile_model` | Batched column statistics |
 | Profiling | `execute_query` | Read-only SQL execution against your warehouse |
 | Profiling | `detect_schema_drift` | Comparison of database columns against manifest definitions |
