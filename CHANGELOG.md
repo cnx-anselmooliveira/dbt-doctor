@@ -8,16 +8,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-<<<<<<< HEAD
+- Description consistency across layers, driven by the real dependency graph from `manifest.json` (no `dbt compile` needed):
+  - `plan_description_updates`, `trace_column_lineage` and `check_description_consistency` MCP tools. Models are classified from their raw SQL (copy, projection, row-altering effects such as `WHERE`, `GROUP BY`, `DISTINCT`, `UNION`, `LIMIT`; filters inside `is_incremental()` blocks are ignored) and each column is traced to its parent column. The bronze layer is the root; the layer order (`--layer-order`) only labels and groups models.
+  - A plain passthrough that keeps the rows must repeat its parent's description identically, and only once the parent's description passed the quality threshold. A transformed column, or one that goes through a filtering or regrouping model, must have its own description (copying the parent's text is rejected as a stale copy). Pure type casts are not enforced by default (`--treat-casts-as-passthrough` copies them too). Unreadable lineage (joins, CTEs, unknown Jinja) is never enforced.
+  - Durable score store (`target/dbt_doctor/description_scores.json`): a score is only valid while the description text and the rubric are unchanged.
+- `update_model_yaml` enforces those rules when writing, copies identical parent descriptions (`apply_copies`), and supports `overwrite_descriptions` and `dry_run`.
 - `evaluate_model_descriptions` and `submit_description_scores` MCP tools: a description-quality review for one model at a time. The client LLM scores each column against an editable rubric (`description_rubric.json`, overridable with `--rubric-file`); dbt-doctor provides the context and deterministic hints, applies the pass threshold and returns every column with its score in points and a status (`ok`, `rewrite` or `missing`). It only scores; it does not write or suggest descriptions. When the database is connected it also describes the table, so columns missing from `schema.yml` are reported too. Wide tables are split into batches automatically. Read-only: nothing is written to the dbt project.
 - `DescriptionQualityEvaluator` analyzer with tests.
-=======
 - Trino support: new `TrinoConnector` selected when the dbt profile has `type: trino`. Supports `none`, `ldap`/`password` and `jwt` authentication. Install with `pip install "dbt-doctor[trino]"`.
 - Tests for `TrinoConnector` (using a fake client) and for adapter selection in `_build_connector`.
 
 ### Changed
+- `update_model_yaml` now replaces existing column descriptions by default (`overwrite_descriptions=True`) and returns a JSON report (status, file, per-column changes, copied/skipped/rejected columns) instead of a text message. Pass `overwrite_descriptions=False` for the previous fill-only behaviour.
 - The data profiler now treats `tinyint` columns as numeric.
->>>>>>> origin/main
 
 ## [0.1.0] - 2025-12-23
 

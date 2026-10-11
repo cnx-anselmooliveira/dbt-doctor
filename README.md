@@ -61,6 +61,18 @@ dbt-doctor does not call any LLM itself. It hands your assistant the columns, th
 
 The default rubric has five questions (not just repeating the column name, explicit unit/format, clear grain, SQL logic reflected, understandable by business users). To change them, copy [description_rubric.json](src/dbt_doctor/description_rubric.json), edit it, and start the server with `--rubric-file /path/to/rubric.json`. The pass threshold follows the number of questions. Run `dbt compile` first so the compiled SQL is available.
 
+### Description Consistency Across Layers
+The same column often gets a different description in each layer even when nothing changed. dbt-doctor reads the dependency graph from `manifest.json` and the raw SQL of each model (no `dbt compile` needed), traces each column to its parent column and applies these rules when you write with `update_model_yaml`:
+
+| Column | What the description must be |
+|---|---|
+| Plain passthrough, model keeps the rows | **Identical** to the parent's, and only once the parent's description has passed the quality threshold. Otherwise the write is blocked until the parent is fixed or scored |
+| Transformed, or the model filters, regroups, dedupes, unions or limits rows | Its **own** text. Sending the parent's text unchanged is rejected as a stale copy |
+| Pure type cast | Not enforced by default (`--treat-casts-as-passthrough` copies it too) |
+| Lineage not readable (joins, CTEs, unknown Jinja) | Not enforced |
+
+Work from the root layer (bronze) downwards: evaluate a model with `evaluate_model_descriptions`/`submit_description_scores`, run `plan_description_updates` on its children, write, then run `dbt parse` so the manifest reflects the new text. A description's score stops applying as soon as its text changes. Use `dry_run=True` to preview a write. The layer order (`--layer-order`, default `landing,bronze,stg,silver,intermediary,gold|view,az`) only labels and groups models; the dependency graph decides how descriptions propagate.
+
 ### End-to-End Documentation Generation
 Execute a complete workflow in a single conversational turn: profile a model, suggest tests, preview changes, and write to schema.yml.
 
@@ -78,11 +90,14 @@ Execute a complete workflow in a single conversational turn: profile a model, su
 | Audit | `get_project_health` | Single-call dashboard summarizing project status |
 | Quality | `evaluate_model_descriptions` | Prepares one model's columns, SQL and a scoring rubric for your AI assistant to judge description quality |
 | Quality | `submit_description_scores` | Records the scores, applies the pass threshold and returns which columns need a rewrite |
+| Lineage | `plan_description_updates` | For one model, which column descriptions must be copied from the parent, written anew, or are blocked |
+| Lineage | `trace_column_lineage` | Follows a column upstream through the layers |
+| Lineage | `check_description_consistency` | Paged overview of description consistency, parents before children |
 | Profiling | `profile_model` | Batched column statistics |
 | Profiling | `execute_query` | Read-only SQL execution against your warehouse |
 | Profiling | `detect_schema_drift` | Comparison of database columns against manifest definitions |
 | Generation | `suggest_tests` | Translation of profile data into dbt test recommendations |
-| Generation | `update_model_yaml` | Safe merging of documentation and tests to schema.yml |
+| Generation | `update_model_yaml` | Writes new descriptions (replacing existing ones, following the lineage rules) and merges tests into the model's schema file |
 | Generation | `generate_model_docs` | Complete end-to-end documentation workflow |
 
 ---
