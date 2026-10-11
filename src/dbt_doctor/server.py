@@ -1,10 +1,12 @@
 """
 dbt-doctor MCP Server — AI-driven quality & governance for dbt projects.
 
-All 20 MCP Tools:
+All 25 MCP Tools:
   Audit:      audit_project, check_test_coverage, analyze_dag, get_project_health
   Quality:    evaluate_model_descriptions, submit_description_scores
   Lineage:    plan_description_updates, trace_column_lineage, check_description_consistency
+  Campaign:   get_table_lineage, start_campaign, get_next_work, get_campaign_status,
+              skip_work_item
   History:    start_run, get_run_report, list_runs
   Profiling:  profile_model, execute_query, detect_schema_drift
   Generation: suggest_tests, update_model_yaml, generate_model_docs
@@ -17,6 +19,7 @@ import argparse
 import json
 import logging
 import sys
+from collections import Counter
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -25,6 +28,13 @@ from typing import Any
 from mcp.server.fastmcp import FastMCP
 
 from .analyzers.auditor import ProjectAuditor
+from .analyzers.campaign import (
+    CHILDREN_SCOPES,
+    DEFERRED_LAYERS,
+    CampaignEngine,
+    CampaignError,
+    validate_tables,
+)
 from .analyzers.dag_analyzer import DagAnalyzer
 from .analyzers.description_quality import (
     DescriptionQualityEvaluator,
@@ -553,6 +563,258 @@ def check_description_consistency(layer: str = "", offset: int = 0, limit: int =
             )
             report["run"] = recorder.info()
     return json.dumps(report, ensure_ascii=False)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CAMPAIGN TOOLS
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def _sql_kind(graph: LineageGraph, uid: str) -> str:
+    shape = graph.shape(uid)
+    if not shape.readable:
+        return "unreadable"
+    if shape.altering:
+        return "altering"
+    return "direct" if shape.kind == "copy" else "projection"
+
+
+@mcp.tool()
+def get_table_lineage(
+    model_name: str, max_depth: int = 0, offset: int = 0, limit: int = 100
+) -> str:
+    """
+    The lineage of ONE table, as a plain list read from the manifest: its parents one level
+    up, and every table below it (all levels).
+
+    Parents include sources, seeds and snapshots, marked `deferred` when they are sources or
+    landing tables (never processed by a campaign). Each descendant shows its layer, its
+    depth (1 = direct child), its number of documented columns and how its SQL reads:
+    `direct` (a plain copy), `projection`, `altering` (it filters, regroups or dedupes rows)
+    or `unreadable` (joins, CTEs). No scores are involved.
+
+    Args:
+        model_name: Exact dbt model name.
+        max_depth: Limit the descendants to this many levels (0 = all levels).
+        offset: First descendant of the page.
+        limit: Descendants per page.
+    """
+    graph = LineageGraph(_get_manifest().get_raw(), _layer_map)
+    uid = graph.by_name.get(model_name)
+    if uid is None:
+        return f"Model '{model_name}' not found. Run `list_models` to see available models."
+    model = graph.models[uid]
+    parents = []
+    for entry in graph.parent_entries(uid):
+        columns = len(graph.models[entry["uid"]].columns) if entry["uid"] in graph.models else None
+        parents.append(
+            {
+                "name": entry["name"],
+                "kind": entry["kind"],
+                "layer": entry["layer"],
+                "columns": columns,
+                "deferred": entry["layer"] in DEFERRED_LAYERS,
+            }
+        )
+    below = graph.descendants(uid, max_depth or None)
+    rows = [
+        {
+            "name": graph.models[u].name,
+            "layer": graph.models[u].layer,
+            "depth": d,
+            "direct": d == 1,
+            "columns": len(graph.models[u].columns),
+            "sql": _sql_kind(graph, u),
+        }
+        for u, d in sorted(below.items(), key=lambda kv: (kv[1], graph.models[kv[0]].name))
+    ]
+    start = max(offset, 0)
+    page = rows[start : start + max(1, min(limit, 500))]
+    end = start + len(page)
+    return json.dumps(
+        {
+            "model": model_name,
+            "layer": model.layer,
+            "columns": len(model.columns),
+            "parents": parents,
+            "direct_children": [r["name"] for r in rows if r["direct"]],
+            "descendants": {
+                "total": len(rows),
+                "by_layer": dict(Counter(r["layer"] for r in rows)),
+                "max_depth": max((r["depth"] for r in rows), default=0),
+                "offset": start,
+                "next_offset": end if end < len(rows) else None,
+                "items": page,
+            },
+        },
+        ensure_ascii=False,
+    )
+
+
+def _get_engine() -> CampaignEngine:
+    recorder = _get_recorder()
+    if recorder is None:
+        raise CampaignError("Campaigns need the run store (do not use --no-run-store).")
+    if not recorder.run_id:
+        hint = ""
+        try:
+            open_run = recorder.store.latest_open_run()
+        except Exception:
+            open_run = None
+        if open_run:
+            hint = (
+                f" An open run exists ({open_run['run_id']}, started "
+                f"{open_run['started_at']:%Y-%m-%d %H:%M}): call start_run with resume=True "
+                "to continue it."
+            )
+        raise CampaignError("No campaign yet. Call start_campaign first." + hint)
+    run = recorder.store.get_run(recorder.run_id)
+    config = json.loads((run or {}).get("params_json") or "{}").get("campaign")
+    if not config:
+        raise CampaignError("The current run is not a campaign. Call start_campaign first.")
+    planner = _get_planner()
+    return CampaignEngine(planner.graph, planner, recorder.store, recorder.run_id, config)
+
+
+@mcp.tool()
+def start_campaign(
+    tables: list[str],
+    goal: str = "",
+    children_scope: str = "needing_docs",
+    pass_ratio: float = 0.7,
+) -> str:
+    """
+    Start a documentation campaign from a list of tables (phase A: analysis, read-only).
+
+    The campaign tests the listed tables and, recursively, the parents of every table that
+    fails (by itself or because of its parents), until they are ok or the bronze layer is
+    reached. Sources and landing tables stay in the list as `deferred`. The direct children
+    are added but not tested: a child is tested only once one of its direct parents has been
+    updated. What is already scored is never tested again. Drive it with
+    `get_next_work`; nothing is modified.
+
+    A table passes when at least `pass_ratio` of its columns are ok: scored above the
+    threshold, or a plain copy of a parent column whose description passed, with the same
+    text. The whole list is kept in the run, so it survives restarts (`start_run` with
+    `resume=True`).
+
+    Args:
+        tables: Exact dbt model names to start from.
+        goal: What the campaign is for.
+        children_scope: Whose direct children are added: 'needing_docs' (the listed tables
+            and the failing parents, default), 'seeds' (only the listed tables) or 'none'.
+        pass_ratio: Share of ok columns that makes a table pass (default 0.7).
+    """
+    graph = LineageGraph(_get_manifest().get_raw(), _layer_map)
+    if children_scope not in CHILDREN_SCOPES:
+        return f"❌ children_scope must be one of {', '.join(CHILDREN_SCOPES)}."
+    if not 0 < pass_ratio <= 1:
+        return "❌ pass_ratio must be greater than 0 and at most 1."
+    try:
+        cleaned = validate_tables(graph, tables)
+    except CampaignError as exc:
+        return f"❌ {exc}"
+    recorder = _get_recorder()
+    if recorder is None:
+        return "❌ Campaigns need the run store (do not use --no-run-store)."
+    config = {"seeds": cleaned, "children_scope": children_scope, "pass_ratio": pass_ratio}
+    started = recorder.start_run(goal or "documentation campaign", "", False, {"campaign": config})
+    if not recorder.run_id:
+        return f"❌ Could not open a run: {started.get('error')}"
+    with _flow_event("start_campaign", None) as (recorder, event):
+        try:
+            engine = _get_engine()
+            seeded = engine.seed(cleaned)
+            work = engine.advance(limit=10)
+        except (RubricError, CampaignError) as exc:
+            event.ok = False
+            event.summary["error"] = str(exc)
+            return f"❌ {exc}"
+        event.summary.update(seeds=len(cleaned), **{"counts": work["counts"]})
+        work.update(config=config, deferred_seeds=seeded["deferred"], run=recorder.info())
+    return json.dumps(work, ensure_ascii=False, default=str)
+
+
+@mcp.tool()
+def get_next_work(limit: int = 10) -> str:
+    """
+    The next tables the campaign needs tested, in order, with instructions.
+
+    Idempotent: call it as often as you like. It recomputes the whole list from the manifest
+    and the stored scores, adds the parents of the tables that failed, and returns up to
+    `limit` tables that still have columns without a valid score. When `phase` is
+    `A_complete` there is nothing left to test. A table asked for repeatedly without any
+    progress is marked `error` after a few requests.
+
+    Args:
+        limit: Maximum number of tables to return.
+    """
+    _get_manifest()
+    try:
+        engine = _get_engine()  # never opens a run: a missing campaign is reported instead
+    except (RubricError, CampaignError) as exc:
+        return f"❌ {exc}"
+    with _flow_event("get_next_work", None) as (recorder, event):
+        try:
+            work = engine.advance(limit=max(1, min(limit, 50)))
+        except (RubricError, CampaignError) as exc:
+            event.ok = False
+            event.summary["error"] = str(exc)
+            return f"❌ {exc}"
+        event.summary.update(phase=work["phase"], tasks=len(work["tasks"]), counts=work["counts"])
+        work["run"] = recorder.info() if recorder is not None else None
+    return json.dumps(work, ensure_ascii=False, default=str)
+
+
+@mcp.tool()
+def get_campaign_status(status: str = "", offset: int = 0, limit: int = 50) -> str:
+    """
+    The whole campaign list, parents before children, paged: each table with its role
+    (seed, ancestor or descendant), depth, layer, status, share of ok columns and reason.
+
+    Statuses: needs_test, passed, failed_self, blocked_by_parent, untested_child, deferred,
+    skipped, error. Read-only: it does not recompute anything (use `get_next_work`).
+
+    Args:
+        status: Show only tables with this status.
+        offset: First table of the page.
+        limit: Tables per page.
+    """
+    _get_manifest()
+    try:
+        return json.dumps(
+            _get_engine().status(status, max(offset, 0), max(1, min(limit, 500))),
+            ensure_ascii=False,
+            default=str,
+        )
+    except (RubricError, CampaignError) as exc:
+        return f"❌ {exc}"
+
+
+@mcp.tool()
+def skip_work_item(model_name: str, reason: str = "") -> str:
+    """
+    Take a table out of the campaign on purpose. It is no longer tested and its parents are
+    not pulled in because of it.
+
+    Args:
+        model_name: A table that is in the campaign.
+        reason: Why it is skipped.
+    """
+    _get_manifest()
+    try:
+        engine = _get_engine()
+    except (RubricError, CampaignError) as exc:
+        return f"❌ {exc}"
+    with _flow_event("skip_work_item", model_name) as (_, event):
+        try:
+            result = engine.skip(model_name, reason)
+        except (RubricError, CampaignError) as exc:
+            event.ok = False
+            event.summary["error"] = str(exc)
+            return f"❌ {exc}"
+        event.summary.update(reason=reason)
+    return json.dumps(result, ensure_ascii=False)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1308,7 +1570,7 @@ def main() -> None:
 
     _connector = _build_connector(project_dir)
     if _connector:
-        logger.info("DB connected — all 20 tools available.")
+        logger.info("DB connected — all 25 tools available.")
     else:
         logger.info(
             "DB not connected — profiling/drift tools unavailable. "
