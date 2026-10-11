@@ -13,6 +13,7 @@ from dbt_doctor.analyzers.description_quality import (
     extract_complex_expression,
     load_rubric,
 )
+from dbt_doctor.connectors.base import ColumnInfo
 
 # ── rubric ────────────────────────────────────────────────────────────────
 
@@ -186,13 +187,12 @@ def evaluator(tmp_path):
     return DescriptionQualityEvaluator(load_rubric(), tmp_path / "state")
 
 
-def perfect(columns, total=10, suggestion=None):
+def perfect(columns, total=10):
     ids = [q.id for q in load_rubric().questions]
     return [
         {
             "column": c,
             "scores": {i: total for i in ids},
-            **({"suggested_description": suggestion} if suggestion else {}),
         }
         for c in columns
     ]
@@ -261,7 +261,6 @@ def test_pass_and_rewrite_at_threshold_boundary(evaluator):
         {
             "column": "col_1",
             "scores": {**dict.fromkeys(ids, 7), "grain": 6},  # 34 -> rewrite
-            "suggested_description": "Better text",
         },
     ]
     result = evaluator.submit(details, scores)
@@ -269,8 +268,9 @@ def test_pass_and_rewrite_at_threshold_boundary(evaluator):
     assert result["status"] == "complete"
     assert by_col["col_0"]["status"] == "ok" and by_col["col_0"]["total"] == 35
     assert by_col["col_1"]["status"] == "rewrite"
-    assert by_col["col_1"]["suggested_description"] == "Better text"
-    assert result["to_rewrite"] == 1
+    assert "suggested_description" not in by_col["col_1"]
+    assert result["summary"] == {"ok": 1, "rewrite": 1, "missing": 0}
+    assert result["to_update"] == ["col_1"]
 
 
 def test_progress_across_batches_and_state_file_lifecycle(evaluator, tmp_path):
@@ -322,8 +322,7 @@ def test_editing_the_rubric_discards_earlier_scores(tmp_path):
 @pytest.mark.parametrize(
     "scores, message",
     [
-        ([], "non-empty list"),
-        ("nope", "non-empty list"),
+        ("nope", "must be a list"),
         (["x"], "must be an object"),
         ([{"column": "ghost", "scores": {}}], "unknown column 'ghost'"),
         ([{"column": "col_0"}], "'scores' must be an object"),
@@ -365,17 +364,6 @@ def test_editing_the_rubric_discards_earlier_scores(tmp_path):
             ],
             "from 0 to 10",
         ),
-        (
-            [
-                {
-                    "column": "col_0",
-                    "scores": dict.fromkeys(
-                        ["tautology", "unit_format", "grain", "sql_logic", "business_clarity"], 1
-                    ),
-                }
-            ],
-            "suggested_description",
-        ),
     ],
 )
 def test_invalid_scores_are_rejected(evaluator, scores, message):
@@ -395,3 +383,118 @@ def test_rejected_submit_records_nothing(evaluator, tmp_path):
 def test_duplicate_column_in_one_call_is_rejected(evaluator):
     with pytest.raises(ScoreValidationError, match="more than once"):
         evaluator.submit(make_details(2), perfect(["col_0", "col_0"]))
+
+
+# ── absent descriptions and output shape ──────────────────────────────────
+
+
+def details_with_missing():
+    details = make_details(3)
+    details["columns"]["col_1"]["description"] = ""
+    details["columns"]["col_2"]["description"] = "   "
+    return details
+
+
+def test_batch_marks_empty_descriptions_as_missing(evaluator):
+    batch = evaluator.next_batch(details_with_missing())
+    status = {c["name"]: c.get("status") for c in batch["columns"]}
+    assert status == {"col_0": None, "col_1": "missing", "col_2": "missing"}
+    assert "suggest" not in batch["instructions"].lower().replace("do not write or suggest", "")
+
+
+def test_missing_columns_are_recorded_without_scores(evaluator):
+    result = evaluator.submit(details_with_missing(), perfect(["col_0"]))
+    by_col = {c["column"]: c for c in result["columns"]}
+    assert result["status"] == "complete"
+    assert by_col["col_1"]["status"] == "missing"
+    assert by_col["col_1"]["total"] is None and by_col["col_1"]["scores"] is None
+    assert result["summary"] == {"ok": 1, "rewrite": 0, "missing": 2}
+    assert result["to_update"] == ["col_1", "col_2"]
+
+
+def test_batch_with_only_missing_columns_completes_with_empty_scores(evaluator):
+    details = make_details(2)
+    for col in details["columns"].values():
+        col["description"] = ""
+    result = evaluator.submit(details, [])
+    assert result["status"] == "complete"
+    assert result["summary"] == {"ok": 0, "rewrite": 0, "missing": 2}
+
+
+def test_scores_sent_for_a_missing_column_are_ignored(evaluator):
+    details = details_with_missing()
+    result = evaluator.submit(details, perfect(["col_0", "col_1"]))
+    by_col = {c["column"]: c for c in result["columns"]}
+    assert by_col["col_1"]["status"] == "missing" and by_col["col_1"]["total"] is None
+
+
+def test_report_is_in_points_with_no_percentages(evaluator):
+    result = evaluator.submit(make_details(1), perfect(["col_0"], total=8))
+    assert result["columns"][0]["total"] == 40
+    assert (result["max_total"], result["pass_total"]) == (50, 35)
+    assert not any("percent" in k or "ratio" in k for k in json.dumps(result).lower().split('"'))
+
+
+# ── database check (DESCRIBE vs manifest) ─────────────────────────────────
+
+
+def db(*names):
+    return [ColumnInfo(name=n, data_type="varchar") for n in names]
+
+
+def test_database_only_columns_are_appended_as_undeclared_and_missing(evaluator):
+    batch = evaluator.next_batch(make_details(2), db_columns=db("col_0", "col_1", "col_extra"))
+    assert batch["database_check"] == {
+        "status": "ok",
+        "detail": None,
+        "undeclared_columns": ["col_extra"],
+        "not_in_database": [],
+    }
+    extra = batch["columns"][-1]
+    assert extra["name"] == "col_extra" and extra["status"] == "missing"
+    assert extra["declared"] is False and extra["data_type"] == "varchar"
+    assert batch["total_columns"] == 3
+
+
+def test_database_match_is_case_insensitive_and_fills_data_type(evaluator):
+    details = make_details(0)
+    details["columns"] = {"Col_A": {"description": "A fully written description", "tests": []}}
+    batch = evaluator.next_batch(details, db_columns=[ColumnInfo(name="col_a", data_type="bigint")])
+    assert batch["database_check"]["undeclared_columns"] == []
+    assert batch["columns"][0]["data_type"] == "bigint"
+
+
+def test_manifest_column_absent_from_database_is_signalled(evaluator):
+    batch = evaluator.next_batch(make_details(2), db_columns=db("col_0"))
+    assert batch["database_check"]["not_in_database"] == ["col_1"]
+    signals = {c["name"]: c["signals"] for c in batch["columns"]}
+    assert signals["col_1"]["not_in_database"] is True
+    assert "not_in_database" not in signals["col_0"]
+
+
+def test_unavailable_database_is_reported_not_hidden(evaluator):
+    batch = evaluator.next_batch(make_details(1), db_note="database not connected")
+    assert batch["database_check"]["status"] == "unavailable"
+    assert "not connected" in batch["database_check"]["detail"]
+    assert "declared" not in batch["columns"][0]
+
+
+def test_undeclared_column_ends_up_in_final_report(evaluator):
+    result = evaluator.submit(
+        make_details(1), perfect(["col_0"]), db_columns=db("col_0", "col_extra")
+    )
+    by_col = {c["column"]: c for c in result["columns"]}
+    assert result["status"] == "complete"
+    assert by_col["col_extra"]["status"] == "missing"
+    assert by_col["col_extra"]["declared"] is False
+    assert by_col["col_0"]["declared"] is True
+    assert result["to_update"] == ["col_extra"]
+    assert result["database_check"]["undeclared_columns"] == ["col_extra"]
+
+
+def test_model_with_no_documented_columns_still_lists_database_columns(evaluator):
+    details = make_details(0)
+    batch = evaluator.next_batch(details, db_columns=db("a", "b"))
+    assert [c["name"] for c in batch["columns"]] == ["a", "b"]
+    result = evaluator.submit(details, [], db_columns=db("a", "b"))
+    assert result["summary"] == {"ok": 0, "rewrite": 0, "missing": 2}
