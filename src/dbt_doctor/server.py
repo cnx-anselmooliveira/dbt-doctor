@@ -1,8 +1,9 @@
 """
 dbt-doctor MCP Server — AI-driven quality & governance for dbt projects.
 
-All 12 MCP Tools:
+All 14 MCP Tools:
   Audit:      audit_project, check_test_coverage, analyze_dag, get_project_health
+  Quality:    evaluate_model_descriptions, submit_description_scores
   Profiling:  profile_model, execute_query, detect_schema_drift
   Generation: suggest_tests, update_model_yaml, generate_model_docs
   Context:    list_models, get_model_details
@@ -21,6 +22,11 @@ from mcp.server.fastmcp import FastMCP
 
 from .analyzers.auditor import ProjectAuditor
 from .analyzers.dag_analyzer import DagAnalyzer
+from .analyzers.description_quality import (
+    DescriptionQualityEvaluator,
+    RubricError,
+    load_rubric,
+)
 from .analyzers.drift_detector import SchemaDriftDetector
 from .analyzers.profiler import DataProfiler
 from .connectors.base import BaseConnector
@@ -44,6 +50,7 @@ mcp = FastMCP("dbt-doctor")
 # ── Module-level singletons (set by main() before mcp.run()) ──────────────
 _manifest: DbtManifestParser | None = None
 _connector: BaseConnector | None = None
+_rubric_path: Path | None = None
 _auditor = ProjectAuditor()
 _dag_analyzer = DagAnalyzer()
 
@@ -53,6 +60,14 @@ def _get_manifest() -> DbtManifestParser:
         raise RuntimeError("dbt-doctor not initialized. Pass --project-dir to the server.")
     _manifest.load()
     return _manifest
+
+
+def _get_evaluator() -> DescriptionQualityEvaluator:
+    manifest = _get_manifest()
+    # Reloaded on every call so edits to the rubric file apply without restarting the server.
+    return DescriptionQualityEvaluator(
+        load_rubric(_rubric_path), manifest.project_dir / "target" / "dbt_doctor"
+    )
 
 
 def _get_connector() -> BaseConnector:
@@ -146,6 +161,67 @@ def get_model_details(model_name: str) -> str:
     lines.append(sql[:2000] + ("\n... [truncated]" if len(sql) > 2000 else ""))
 
     return "\n".join(lines)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# DESCRIPTION QUALITY TOOLS
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+@mcp.tool()
+def evaluate_model_descriptions(model_name: str, offset: int = 0) -> str:
+    """
+    Prepare the next batch of columns of ONE model for a description-quality review.
+
+    Read-only. Returns the model context, compiled SQL, deterministic signals per column
+    and a scoring rubric. You (the AI assistant) judge each column on each rubric question,
+    then send the scores with `submit_description_scores`. Wide tables are split into
+    batches: keep calling this with `offset=next_offset` until `next_offset` is null.
+
+    Start a new evaluation with offset=0 (this discards any unfinished evaluation of the
+    same model). Requires `dbt compile` so the compiled SQL is available.
+
+    Args:
+        model_name: Exact dbt model name.
+        offset: Index of the first column of the batch. 0 starts a new evaluation.
+    """
+    parser = _get_manifest()
+    details = parser.get_model_details(model_name)
+    if not details:
+        return f"Model '{model_name}' not found. Run `list_models` to see available models."
+    try:
+        batch = _get_evaluator().next_batch(details, offset)
+    except (RubricError, ValueError) as exc:
+        return f"❌ {exc}"
+    return json.dumps(batch, ensure_ascii=False)
+
+
+@mcp.tool()
+def submit_description_scores(model_name: str, scores: list[dict]) -> str:
+    """
+    Record your scores for a batch from `evaluate_model_descriptions`.
+
+    Each item: {'column': str, 'scores': {<question_id>: <number>}, 'suggested_description': str}.
+    Every rubric question id must be present. `suggested_description` is required when the
+    column's total is below the pass threshold. Invalid input is rejected as a whole.
+
+    While columns remain it returns progress and the next offset. When every column of the
+    model has been scored it returns the final report: each column with its total, status
+    ('ok' or 'rewrite') and suggested description. This tool does not modify any dbt file.
+
+    Args:
+        model_name: Exact dbt model name.
+        scores: List of per-column scores for the columns of the current batch.
+    """
+    parser = _get_manifest()
+    details = parser.get_model_details(model_name)
+    if not details:
+        return f"Model '{model_name}' not found. Run `list_models` to see available models."
+    try:
+        result = _get_evaluator().submit(details, scores)
+    except (RubricError, ValueError) as exc:
+        return f"❌ {exc}"
+    return json.dumps(result, ensure_ascii=False)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -676,12 +752,29 @@ def main() -> None:
         help="Logging verbosity (default: INFO).",
     )
 
+    arg_parser.add_argument(
+        "--rubric-file",
+        type=str,
+        default=None,
+        help=(
+            "Path to a custom description-quality rubric JSON "
+            "(default: the rubric bundled with dbt-doctor)."
+        ),
+    )
+
     args, _ = arg_parser.parse_known_args()
 
     # Configure logging
     logging.getLogger().setLevel(getattr(logging, args.log_level))
 
-    global _manifest, _connector
+    global _manifest, _connector, _rubric_path
+
+    if args.rubric_file:
+        _rubric_path = Path(args.rubric_file)
+        try:
+            load_rubric(_rubric_path)
+        except RubricError as exc:
+            arg_parser.error(str(exc))
 
     project_dir = args.project_dir
     logger.info("Starting dbt-doctor for project at: %s", project_dir)
@@ -695,7 +788,7 @@ def main() -> None:
 
     _connector = _build_connector(project_dir)
     if _connector:
-        logger.info("DB connected — all 12 tools available.")
+        logger.info("DB connected — all 14 tools available.")
     else:
         logger.info(
             "DB not connected — profiling/drift tools unavailable. "
