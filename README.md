@@ -68,6 +68,7 @@ The same column often gets a different description in each layer even when nothi
 |---|---|
 | Plain passthrough, model keeps the rows | **Identical** to the parent's, and only once the parent's description has passed the quality threshold. Otherwise the write is blocked until the parent is fixed or scored |
 | Transformed, or the model filters, regroups, dedupes, unions or limits rows | Its **own** text. Sending the parent's text unchanged is rejected as a stale copy |
+| Parent is a source, not a dbt model | Not enforced: described on its own, like the root layer |
 | Pure type cast | Not enforced by default (`--treat-casts-as-passthrough` copies it too) |
 | Lineage not readable (joins, CTEs, unknown Jinja) | Not enforced |
 

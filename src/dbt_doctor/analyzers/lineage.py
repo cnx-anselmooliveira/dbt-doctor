@@ -292,6 +292,18 @@ class LineagePlanner:
         plain = edge.kind in ("passthrough", "renamed") or (
             edge.kind == "cast" and self.casts_are_passthrough
         )
+        if plain and not edge.effects and parent_model is None:
+            # The parent is a source (or another external object), not a dbt model: its
+            # descriptions are never scored, so there is nothing to copy from and the
+            # column is described on its own, like the root layer.
+            entry.update(
+                rule="free",
+                action="write_new" if empty else "keep",
+                verdict="missing" if empty else "source_parent",
+                reason="the parent is a source, not a dbt model: described on its own",
+            )
+            return entry
+
         if plain and not edge.effects:
             status = self._parent_status(edge.parent or "", edge.parent_column or "", parent_text)
             entry.update(rule="must_copy", parent_status=status)

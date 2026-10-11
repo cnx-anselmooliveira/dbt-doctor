@@ -302,7 +302,7 @@ def test_root_layer_is_described_on_its_own(store):
     assert plan_entry(planner_for(models, store), "raw_orders", "id")["action"] == "write_new"
 
 
-def test_source_parent_is_never_copied(store):
+def test_source_parent_is_described_on_its_own(store):
     models = [
         {
             "name": "silver_from_source",
@@ -318,7 +318,10 @@ def test_source_parent_is_never_copied(store):
     manifest["nodes"]["model.proj.silver_from_source"]["depends_on"]["nodes"] = ["source.proj.s.t"]
     planner = LineagePlanner(LineageGraph(manifest), store, FP)
     entry = plan_entry(planner, "silver_from_source", "id")
-    assert entry["action"] == "blocked" and entry["parent_status"] == "source"
+    assert (entry["rule"], entry["action"], entry["verdict"]) == ("free", "keep", "source_parent")
+    assert "blocked" not in {
+        e["action"] for e in planner.plan_model("silver_from_source")["columns"]
+    }
 
 
 # ── write barrier ─────────────────────────────────────────────────────────
@@ -498,3 +501,32 @@ def test_window_in_another_column_does_not_make_a_passthrough_stale(store):
         "id",
     )
     assert entry["rule"] == "must_copy" and entry["verdict"] == "ok"
+
+
+def test_columns_over_a_source_can_be_written_freely(store):
+    models = [
+        {
+            "name": "stg_from_source",
+            "sql": "select id, name as customer_name from {{ source('s', 't') }}",
+            "columns": {"id": "", "customer_name": "Old"},
+            "folders": ["stg"],
+        }
+    ]
+    manifest = make_manifest(
+        *models, sources={"source.proj.s.t": {"columns": {"id": {"description": "src"}}}}
+    )
+    manifest["nodes"]["model.proj.stg_from_source"]["depends_on"]["nodes"] = ["source.proj.s.t"]
+    planner = LineagePlanner(LineageGraph(manifest), store, FP)
+    assert plan_entry(planner, "stg_from_source", "id")["action"] == "write_new"
+    final, report = planner.enforce(
+        "stg_from_source",
+        [
+            {"name": "id", "description": "Own text"},
+            {"name": "customer_name", "description": "New"},
+        ],
+    )
+    assert {c["name"]: c["description"] for c in final} == {
+        "id": "Own text",
+        "customer_name": "New",
+    }
+    assert report == {"copied": [], "skipped": [], "rejected": []}
