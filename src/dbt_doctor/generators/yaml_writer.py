@@ -18,6 +18,10 @@ def _make_yaml() -> YAML:
     return yaml
 
 
+def _same_text(a: Any, b: Any) -> bool:
+    return " ".join(str(a or "").split()) == " ".join(str(b or "").split())
+
+
 class YamlWriter:
     """
     Safely creates or updates dbt schema.yml files.
@@ -85,6 +89,8 @@ class YamlWriter:
         model_sql_path: str,
         description: str = "",
         columns: list[dict[str, Any]] | None = None,
+        overwrite_descriptions: bool = False,
+        dry_run: bool = False,
     ) -> dict[str, Any]:
         """
         Insert or update documentation for one model in its schema.yml.
@@ -99,10 +105,17 @@ class YamlWriter:
             Model-level description to write.
         columns:
             List of column dicts: {'name': str, 'description': str, 'tests': list}
+        overwrite_descriptions:
+            When True, a non-empty description replaces the existing one; otherwise an
+            existing description is kept and only empty ones are filled. Tests are always
+            merged additively.
+        dry_run:
+            Compute the changes without writing anything.
 
         Returns
         -------
-        dict with 'file_path' on success, or 'error' on failure.
+        dict with 'file_path' and 'changes' on success, or 'error' on failure. Each change
+        is {'scope': 'model'|'column', 'column', 'old', 'new'}.
         """
         yaml_path = self.find_or_plan_schema_path(model_sql_path)
         data = self._load(yaml_path) or CommentedMap({"version": 2, "models": CommentedSeq()})
@@ -121,8 +134,15 @@ class YamlWriter:
             model_entry = CommentedMap({"name": model_name})
             data["models"].append(model_entry)
 
+        changes: list[dict[str, Any]] = []
+
         # Update description
         if description:
+            old_model_desc = model_entry.get("description")
+            if not _same_text(old_model_desc, description):
+                changes.append(
+                    {"scope": "model", "column": None, "old": old_model_desc, "new": description}
+                )
             model_entry["description"] = description
 
         # Merge columns
@@ -136,9 +156,20 @@ class YamlWriter:
                     continue
                 if col_name in col_map:
                     existing = col_map[col_name]
-                    # Update description only if not already set
-                    if new_col.get("description") and not existing.get("description"):
-                        existing["description"] = new_col["description"]
+                    # Fill empty descriptions; replace existing ones only when asked to
+                    new_desc = (new_col.get("description") or "").strip()
+                    old_desc = existing.get("description")
+                    can_replace = not old_desc or overwrite_descriptions
+                    if new_desc and can_replace and not _same_text(old_desc, new_desc):
+                        changes.append(
+                            {
+                                "scope": "column",
+                                "column": col_name,
+                                "old": old_desc,
+                                "new": new_desc,
+                            }
+                        )
+                        existing["description"] = new_desc
                     # Merge tests (add new, don't remove existing)
                     if new_col.get("tests"):
                         existing_tests = list(existing.get("tests") or [])
@@ -154,8 +185,20 @@ class YamlWriter:
                     col_entry = CommentedMap(new_col)
                     existing_cols.append(col_entry)
                     col_map[col_name] = col_entry
+                    if new_col.get("description"):
+                        changes.append(
+                            {
+                                "scope": "column",
+                                "column": col_name,
+                                "old": None,
+                                "new": new_col["description"],
+                            }
+                        )
 
             model_entry["columns"] = existing_cols
+
+        if dry_run:
+            return {"file_path": str(yaml_path), "changes": changes, "dry_run": True}
 
         # Write back
         yaml_path.parent.mkdir(parents=True, exist_ok=True)
@@ -163,7 +206,7 @@ class YamlWriter:
             with open(yaml_path, "w", encoding="utf-8") as f:
                 self._yaml.dump(data, f)
             logger.info("Wrote YAML to %s", yaml_path)
-            return {"file_path": str(yaml_path)}
+            return {"file_path": str(yaml_path), "changes": changes, "dry_run": False}
         except Exception as exc:
             logger.error("Failed to write YAML: %s", exc)
             return {"error": str(exc)}

@@ -1,9 +1,10 @@
 """
 dbt-doctor MCP Server — AI-driven quality & governance for dbt projects.
 
-All 14 MCP Tools:
+All 17 MCP Tools:
   Audit:      audit_project, check_test_coverage, analyze_dag, get_project_health
   Quality:    evaluate_model_descriptions, submit_description_scores
+  Lineage:    plan_description_updates, trace_column_lineage, check_description_consistency
   Profiling:  profile_model, execute_query, detect_schema_drift
   Generation: suggest_tests, update_model_yaml, generate_model_docs
   Context:    list_models, get_model_details
@@ -28,7 +29,9 @@ from .analyzers.description_quality import (
     load_rubric,
 )
 from .analyzers.drift_detector import SchemaDriftDetector
+from .analyzers.lineage import DEFAULT_LAYER_ORDER, LayerMap, LineageGraph, LineagePlanner
 from .analyzers.profiler import DataProfiler
+from .analyzers.score_store import STORE_FILENAME, ScoreStore
 from .connectors.base import BaseConnector, ColumnInfo
 from .core.manifest import DbtManifestParser
 from .core.profiles import DbtProfileParser
@@ -51,6 +54,8 @@ mcp = FastMCP("dbt-doctor")
 _manifest: DbtManifestParser | None = None
 _connector: BaseConnector | None = None
 _rubric_path: Path | None = None
+_layer_map: LayerMap = LayerMap()
+_casts_as_passthrough: bool = False
 _auditor = ProjectAuditor()
 _dag_analyzer = DagAnalyzer()
 
@@ -65,8 +70,19 @@ def _get_manifest() -> DbtManifestParser:
 def _get_evaluator() -> DescriptionQualityEvaluator:
     manifest = _get_manifest()
     # Reloaded on every call so edits to the rubric file apply without restarting the server.
+    state_dir = manifest.project_dir / "target" / "dbt_doctor"
     return DescriptionQualityEvaluator(
-        load_rubric(_rubric_path), manifest.project_dir / "target" / "dbt_doctor"
+        load_rubric(_rubric_path), state_dir, ScoreStore(state_dir / STORE_FILENAME)
+    )
+
+
+def _get_planner() -> LineagePlanner:
+    manifest = _get_manifest()
+    state_dir = manifest.project_dir / "target" / "dbt_doctor"
+    graph = LineageGraph(manifest.get_raw(), _layer_map)
+    fingerprint = load_rubric(_rubric_path).fingerprint()
+    return LineagePlanner(
+        graph, ScoreStore(state_dir / STORE_FILENAME), fingerprint, _casts_as_passthrough
     )
 
 
@@ -250,6 +266,79 @@ def submit_description_scores(model_name: str, scores: list[dict]) -> str:
     except (RubricError, ValueError) as exc:
         return f"❌ {exc}"
     return json.dumps(result, ensure_ascii=False)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# LINEAGE TOOLS
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+@mcp.tool()
+def plan_description_updates(model_name: str) -> str:
+    """
+    Read-only plan for the column descriptions of ONE model, based on its lineage.
+
+    For each documented column it says what the description must be:
+    - `copy`: a plain passthrough that keeps the rows. It must repeat the parent column's
+      description identically, and the parent's description passed the quality threshold.
+    - `write_new`: the column is empty, transformed, or goes through a model that filters
+      or regroups rows, so it needs a description of its own (a copy of the parent's text
+      would be stale).
+    - `blocked`: the parent column has no description, has not been scored, or failed the
+      threshold. Fix or score the parent first (`evaluate_model_descriptions`).
+    - `keep`: nothing to do.
+
+    Work models from the root layer (bronze) downwards. `update_model_yaml` enforces the
+    same rules when writing. Run `dbt parse` after writing so the manifest reflects it.
+
+    Args:
+        model_name: Exact dbt model name.
+    """
+    try:
+        return json.dumps(_get_planner().plan_model(model_name), ensure_ascii=False)
+    except (RubricError, ValueError) as exc:
+        return f"❌ {exc}"
+
+
+@mcp.tool()
+def trace_column_lineage(model_name: str, column: str) -> str:
+    """
+    Follow a column upstream through the dbt layers, up to the root layer or the first
+    model where its lineage cannot be read with confidence.
+
+    Each step shows the model, its layer, whether the column is described there, how it is
+    built (passthrough, renamed, transformed) and the row-altering effects of the model.
+
+    Args:
+        model_name: Exact dbt model name.
+        column: Column name.
+    """
+    try:
+        chain = _get_planner().trace(model_name, column)
+    except (RubricError, ValueError) as exc:
+        return f"❌ {exc}"
+    return json.dumps({"model": model_name, "column": column, "chain": chain}, ensure_ascii=False)
+
+
+@mcp.tool()
+def check_description_consistency(layer: str = "", offset: int = 0, limit: int = 50) -> str:
+    """
+    Paged overview of description consistency across the project, parents before children.
+
+    For every model it counts the columns that need `copy`, `write_new`, are `blocked` or
+    fine (`keep`). Use `layer` (e.g. 'bronze', 'silver', 'gold') to focus on one layer and
+    `offset`/`limit` to page. Follow up with `plan_description_updates` on a model.
+
+    Args:
+        layer: Optional layer label to filter by (empty = all models).
+        offset: Index of the first model of the page.
+        limit: Models per page.
+    """
+    try:
+        report = _get_planner().consistency(layer, max(offset, 0), max(1, min(limit, 200)))
+    except (RubricError, ValueError) as exc:
+        return f"❌ {exc}"
+    return json.dumps(report, ensure_ascii=False)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -604,24 +693,34 @@ def update_model_yaml(
     model_name: str,
     description: str,
     columns: list[dict],
+    overwrite_descriptions: bool = True,
+    dry_run: bool = False,
+    apply_copies: bool = True,
 ) -> str:
     """
-    Write or update documentation and tests in the model's schema.yml file.
+    Write descriptions and tests to the model's schema YAML, following the lineage rules.
 
     Uses ruamel.yaml to preserve existing human comments and other models in the same file.
-    Merges new column docs/tests non-destructively — never removes existing content.
+    Descriptions you send REPLACE the existing ones (`overwrite_descriptions`); tests are
+    only added, never removed. Before writing, each column is checked against its lineage:
+    - a plain passthrough that keeps the rows gets the parent's description copied
+      identically (the text you send is ignored), and only if the parent's description
+      passed the quality threshold; otherwise the column is skipped and the reason given;
+    - a transformed column, or one in a model that filters/regroups rows, is rejected if
+      you send the parent's text unchanged: it needs a description of its own;
+    - with `apply_copies`, columns that must be copied are copied even if not sent.
+
+    Use `dry_run=True` to preview the changes without writing. Run `dbt parse` after
+    writing so the manifest reflects the new descriptions.
 
     Args:
         model_name: Exact dbt model name (e.g. 'stg_orders').
-        description: A clear, business-level description of what this model represents.
+        description: Model-level description (empty = leave unchanged).
         columns: List of column dicts. Each: {'name': str, 'description': str, 'tests': list}
                  Tests can be strings ('not_null') or dicts ({'accepted_values': {'values': [...]}}).
-
-    Example columns:
-        [
-          {'name': 'order_id', 'description': 'Unique order identifier', 'tests': ['not_null', 'unique']},
-          {'name': 'status', 'tests': [{'accepted_values': {'values': ['placed', 'shipped']}}]}
-        ]
+        overwrite_descriptions: Replace existing column descriptions (default True).
+        dry_run: Report the changes without writing.
+        apply_copies: Also copy parent descriptions into columns that must repeat them.
     """
     parser = _get_manifest()
     details = parser.get_model_details(model_name)
@@ -632,6 +731,11 @@ def update_model_yaml(
     if not model_path:
         return f"Could not determine SQL file path for '{model_name}'."
 
+    try:
+        to_write, report = _get_planner().enforce(model_name, columns, apply_copies)
+    except (RubricError, ValueError) as exc:
+        return f"❌ {exc}"
+
     project_dir = _manifest.project_dir if _manifest else Path(".")
     writer = YamlWriter(str(project_dir))
 
@@ -639,17 +743,25 @@ def update_model_yaml(
         model_name=model_name,
         model_sql_path=model_path,
         description=description,
-        columns=columns,
+        columns=to_write,
+        overwrite_descriptions=overwrite_descriptions,
+        dry_run=dry_run,
     )
 
     if "error" in result:
         return f"❌ Failed to update YAML: {result['error']}"
 
-    return (
-        f"✅ Successfully updated documentation for '{model_name}'!\n"
-        f"   Written to: {result['file_path']}\n"
-        f"   Columns documented: {len(columns)}\n"
-        f"   Run `dbt parse` to refresh the manifest."
+    return json.dumps(
+        {
+            "status": "dry_run" if dry_run else "written",
+            "model": model_name,
+            "file": result["file_path"],
+            "changes": result["changes"],
+            **report,
+            "next_step": None if dry_run else "Run `dbt parse` to refresh the manifest.",
+        },
+        ensure_ascii=False,
+        default=str,
     )
 
 
@@ -799,12 +911,39 @@ def main() -> None:
         ),
     )
 
+    arg_parser.add_argument(
+        "--layer-order",
+        type=str,
+        default=DEFAULT_LAYER_ORDER,
+        help=(
+            "Comma-separated layer order used to label models in lineage reports; join "
+            "labels that share a level with '|' (default: %(default)s). The dependency "
+            "graph, not this order, decides how descriptions propagate."
+        ),
+    )
+
+    arg_parser.add_argument(
+        "--treat-casts-as-passthrough",
+        action="store_true",
+        help=(
+            "Treat a plain cast(col as type) as a passthrough, so its description is copied "
+            "identically from the parent. By default casts are not enforced."
+        ),
+    )
+
     args, _ = arg_parser.parse_known_args()
 
     # Configure logging
     logging.getLogger().setLevel(getattr(logging, args.log_level))
 
-    global _manifest, _connector, _rubric_path
+    global _manifest, _connector, _rubric_path, _layer_map, _casts_as_passthrough
+
+    _casts_as_passthrough = args.treat_casts_as_passthrough
+
+    try:
+        _layer_map = LayerMap(args.layer_order)
+    except ValueError as exc:
+        arg_parser.error(str(exc))
 
     if args.rubric_file:
         _rubric_path = Path(args.rubric_file)
@@ -825,7 +964,7 @@ def main() -> None:
 
     _connector = _build_connector(project_dir)
     if _connector:
-        logger.info("DB connected — all 14 tools available.")
+        logger.info("DB connected — all 17 tools available.")
     else:
         logger.info(
             "DB not connected — profiling/drift tools unavailable. "

@@ -8,6 +8,7 @@ for tables that need more than one batch.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from dataclasses import dataclass
@@ -15,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from ..connectors.base import ColumnInfo
+from .score_store import ScoreStore
 
 DEFAULT_RUBRIC_PATH = Path(__file__).resolve().parent.parent / "description_rubric.json"
 
@@ -63,6 +65,19 @@ class Rubric:
 
     def passes(self, total: float) -> bool:
         return total + 1e-9 >= self.threshold
+
+    def fingerprint(self) -> str:
+        """Short stable id of everything that decides a score's meaning (not the wording)."""
+        payload = json.dumps(
+            {
+                "version": self.version,
+                "ids": [q.id for q in self.questions],
+                "max": self.max_score_per_question,
+                "ratio": self.pass_ratio,
+            },
+            sort_keys=True,
+        )
+        return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:12]
 
 
 def load_rubric(path: str | Path | None = None) -> Rubric:
@@ -352,9 +367,10 @@ class DescriptionQualityEvaluator:
     deleted when a new evaluation starts (``offset=0``) and when it completes.
     """
 
-    def __init__(self, rubric: Rubric, state_dir: Path) -> None:
+    def __init__(self, rubric: Rubric, state_dir: Path, store: ScoreStore | None = None) -> None:
         self.rubric = rubric
         self.state_dir = Path(state_dir)
+        self.store = store
 
     # ── state file ────────────────────────────────────────────────────────
 
@@ -517,6 +533,20 @@ class DescriptionQualityEvaluator:
             entry["description"] = descriptions[column]
             entry["declared"] = declared[column]
             results[column] = entry
+        if self.store:
+            self.store.record_many(
+                model,
+                self.rubric.fingerprint(),
+                [
+                    {
+                        "column": c,
+                        "description": descriptions[c],
+                        "total": e["total"],
+                        "status": e["status"],
+                    }
+                    for c, e in scored.items()
+                ],
+            )
         # Absent descriptions need no judgement: they are always flagged for update.
         for column in absent:
             results.setdefault(
