@@ -14,6 +14,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from ..connectors.base import ColumnInfo
+
 DEFAULT_RUBRIC_PATH = Path(__file__).resolve().parent.parent / "description_rubric.json"
 
 # Character budget for one batch payload, and the knobs that keep batches useful.
@@ -278,6 +280,67 @@ def compute_signals(
 # ═══════════════════════════════════════════════════════════════════════════
 
 
+_STATUSES = ("ok", "rewrite", "missing")
+
+
+def _is_missing(description: str | None) -> bool:
+    return not (description or "").strip()
+
+
+def merge_columns(
+    details: dict[str, Any], db_columns: list[ColumnInfo] | None, db_note: str | None = None
+) -> tuple[list[tuple[str, dict[str, Any]]], dict[str, Any]]:
+    """Combine the manifest columns with the table's real columns (the ``DESCRIBE`` view).
+
+    The manifest only knows columns declared in schema.yml, so a column that exists in the
+    table but is not documented would never show up. Manifest columns come first (YAML
+    order), then the columns found only in the database, flagged ``declared=False``.
+    Returns the merged list and a ``database_check`` summary.
+    """
+    manifest = details.get("columns", {})
+    if db_columns is None:
+        columns = [(n, {**c, "declared": True}) for n, c in manifest.items()]
+        check = {
+            "status": "unavailable",
+            "detail": db_note or "database connector not available",
+            "undeclared_columns": [],
+            "not_in_database": [],
+        }
+        return columns, check
+
+    db_by_name = {c.name.lower(): c for c in db_columns}
+    columns: list[tuple[str, dict[str, Any]]] = []
+    not_in_database: list[str] = []
+    for name, col in manifest.items():
+        merged = {**col, "declared": True}
+        db = db_by_name.get(name.lower())
+        if db is None:
+            not_in_database.append(name)
+            merged["in_database"] = False
+        elif not col.get("data_type"):
+            merged["data_type"] = db.data_type
+        columns.append((name, merged))
+
+    known = {n.lower() for n in manifest}
+    undeclared: list[str] = []
+    for db in db_columns:
+        if db.name.lower() not in known:
+            undeclared.append(db.name)
+            columns.append(
+                (
+                    db.name,
+                    {"description": "", "data_type": db.data_type, "tests": [], "declared": False},
+                )
+            )
+    check = {
+        "status": "ok",
+        "detail": None,
+        "undeclared_columns": undeclared,
+        "not_in_database": not_in_database,
+    }
+    return columns, check
+
+
 def _safe_filename(model_name: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]", "_", model_name)
 
@@ -328,15 +391,20 @@ class DescriptionQualityEvaluator:
     # ── batch ─────────────────────────────────────────────────────────────
 
     def next_batch(
-        self, details: dict[str, Any], offset: int = 0, max_chars: int = DEFAULT_BATCH_CHARS
+        self,
+        details: dict[str, Any],
+        offset: int = 0,
+        max_chars: int = DEFAULT_BATCH_CHARS,
+        db_columns: list[ColumnInfo] | None = None,
+        db_note: str | None = None,
     ) -> dict[str, Any]:
         """Return the next batch of columns to judge, starting at ``offset``."""
         model = details["name"]
-        columns = list(details.get("columns", {}).items())
+        columns, database_check = merge_columns(details, db_columns, db_note)
         total = len(columns)
         if total == 0:
             raise ValueError(
-                f"Model '{model}' has no columns in the manifest. "
+                f"Model '{model}' has no columns in the manifest or in the database. "
                 "Document its columns in schema.yml and run `dbt parse` first."
             )
         if offset < 0 or offset >= total:
@@ -351,6 +419,7 @@ class DescriptionQualityEvaluator:
             "model_description": details.get("description", ""),
             "schema": details.get("schema"),
             "unique_columns": unique_columns,
+            "database_check": database_check,
             "sql": {"kind": sql_kind, "code": sql},
             "rubric": {
                 "scale": f"integer 0..{self.rubric.max_score_per_question}",
@@ -374,6 +443,12 @@ class DescriptionQualityEvaluator:
                 "tests": col.get("tests", []),
                 "signals": compute_signals(name, col.get("data_type"), col.get("description"), sql),
             }
+            if col.get("in_database") is False:
+                entry["signals"]["not_in_database"] = True
+            if not col.get("declared", True):
+                entry["declared"] = False
+            if _is_missing(col.get("description")):
+                entry["status"] = "missing"  # recorded automatically, no score needed
             size = len(json.dumps(entry, ensure_ascii=False))
             if len(batch) >= MIN_COLUMNS_PER_BATCH and used + size > room:
                 break
@@ -401,36 +476,60 @@ class DescriptionQualityEvaluator:
 
     def _instructions(self, model: str) -> str:
         example_scores = {q.id: self.rubric.max_score_per_question for q in self.rubric.questions}
-        example = json.dumps(
-            [{"column": "<name>", "scores": example_scores, "suggested_description": "<text>"}]
-        )
+        example = json.dumps([{"column": "<name>", "scores": example_scores}])
         return (
-            f"Judge every column in 'columns' on each rubric question with an integer score "
+            "Judge every column in 'columns' on each rubric question with an integer score "
             f"(0 = not satisfied, {self.rubric.max_score_per_question} = fully satisfied), using "
             "the description, the SQL, the signals and the model context. Signals are hints, "
-            "not scores. For any column whose total would be below "
-            f"{self.rubric.threshold:g}, also write 'suggested_description': a business-level "
-            "rewrite in the same language as the existing descriptions that states the unit or "
-            "format, the grain and any logic from the SQL. Then call "
-            f"submit_description_scores(model_name='{model}', scores={example}). "
+            "not scores. Only score; do not write or suggest descriptions. Columns with "
+            "'status': 'missing' have an empty description and are recorded automatically, so "
+            "do not score them. Columns with 'declared': false exist in the table but are not "
+            "documented in schema.yml (database_check lists them). If database_check.status "
+            "is 'unavailable', tell the user the columns could not be checked against the "
+            "database. Then call "
+            f"submit_description_scores(model_name='{model}', scores={example}); send an empty "
+            "list if every column of the batch is 'missing'. "
             "If 'next_offset' is not null, call evaluate_model_descriptions again with "
             "offset=next_offset. This tool never modifies any file in the dbt project."
         )
 
     # ── scores ────────────────────────────────────────────────────────────
 
-    def submit(self, details: dict[str, Any], scores: list[dict[str, Any]]) -> dict[str, Any]:
+    def submit(
+        self,
+        details: dict[str, Any],
+        scores: list[dict[str, Any]],
+        db_columns: list[ColumnInfo] | None = None,
+        db_note: str | None = None,
+    ) -> dict[str, Any]:
         """Validate and record scores for a batch. Returns progress, or the final report."""
         model = details["name"]
-        names = list(details.get("columns", {}))
-        descriptions = {n: c.get("description", "") for n, c in details["columns"].items()}
+        merged, database_check = merge_columns(details, db_columns, db_note)
+        names = [n for n, _ in merged]
+        descriptions = {n: c.get("description", "") for n, c in merged}
+        declared = {n: c.get("declared", True) for n, c in merged}
 
-        scored = self._validate(scores, names)
+        absent = {n for n, d in descriptions.items() if _is_missing(d)}
+        scored = self._validate(scores, names, absent)
         state = self._load_state(model)
         results: dict[str, Any] = state.get("results", {})
         for column, entry in scored.items():
             entry["description"] = descriptions[column]
+            entry["declared"] = declared[column]
             results[column] = entry
+        # Absent descriptions need no judgement: they are always flagged for update.
+        for column in absent:
+            results.setdefault(
+                column,
+                {
+                    "column": column,
+                    "description": descriptions[column],
+                    "declared": declared[column],
+                    "status": "missing",
+                    "scores": None,
+                    "total": None,
+                },
+            )
 
         pending = [n for n in names if n not in results]
         if pending:
@@ -445,27 +544,28 @@ class DescriptionQualityEvaluator:
 
         report = [results[n] for n in names]
         self._reset(model)
-        rewrite = [r["column"] for r in report if r["status"] == "rewrite"]
         return {
             "status": "complete",
             "model": model,
             "max_total": self.rubric.max_total,
             "pass_total": self.rubric.threshold,
             "total_columns": len(names),
-            "to_rewrite": len(rewrite),
-            "columns": [
-                {"column": r["column"], **{k: v for k, v in r.items() if k != "column"}}
-                for r in report
-            ],
+            "summary": {s: sum(1 for r in report if r["status"] == s) for s in _STATUSES},
+            "to_update": [r["column"] for r in report if r["status"] != "ok"],
+            "database_check": database_check,
+            "columns": report,
             "next_step": (
-                "Columns with status 'rewrite' should have their description replaced by "
-                "'suggested_description'. Review them with the user before applying."
+                "Columns with status 'missing' or 'rewrite' (listed in 'to_update') are the "
+                "ones a documentation-update step should change; leave 'ok' columns untouched. "
+                "Columns with 'declared': false must be added to schema.yml, not just edited."
             ),
         }
 
-    def _validate(self, scores: Any, names: list[str]) -> dict[str, dict[str, Any]]:
-        if not isinstance(scores, list) or not scores:
-            raise ScoreValidationError("'scores' must be a non-empty list.")
+    def _validate(
+        self, scores: Any, names: list[str], absent: set[str]
+    ) -> dict[str, dict[str, Any]]:
+        if not isinstance(scores, list):
+            raise ScoreValidationError("'scores' must be a list.")
         ids = [q.id for q in self.rubric.questions]
         max_score = self.rubric.max_score_per_question
         problems: list[str] = []
@@ -482,6 +582,8 @@ class DescriptionQualityEvaluator:
             if column in accepted:
                 problems.append(f"'{column}': sent more than once in this call.")
                 continue
+            if column in absent:
+                continue  # empty description: recorded as 'missing', any score is ignored
             values = item.get("scores")
             if not isinstance(values, dict):
                 problems.append(f"'{column}': 'scores' must be an object keyed by question id.")
@@ -507,21 +609,11 @@ class DescriptionQualityEvaluator:
                 continue
 
             total = sum(values[q] for q in ids)
-            suggestion = item.get("suggested_description")
-            suggestion = suggestion.strip() if isinstance(suggestion, str) else ""
-            passed = self.rubric.passes(total)
-            if not passed and not suggestion:
-                problems.append(
-                    f"'{column}': total {total:g} is below {self.rubric.threshold:g}, so it "
-                    "needs a non-empty 'suggested_description'."
-                )
-                continue
             accepted[column] = {
                 "column": column,
                 "scores": {q: values[q] for q in ids},
                 "total": total,
-                "status": "ok" if passed else "rewrite",
-                "suggested_description": suggestion or None,
+                "status": "ok" if self.rubric.passes(total) else "rewrite",
             }
 
         if problems:

@@ -29,7 +29,7 @@ from .analyzers.description_quality import (
 )
 from .analyzers.drift_detector import SchemaDriftDetector
 from .analyzers.profiler import DataProfiler
-from .connectors.base import BaseConnector
+from .connectors.base import BaseConnector, ColumnInfo
 from .core.manifest import DbtManifestParser
 from .core.profiles import DbtProfileParser
 from .core.project import DbtProjectParser
@@ -68,6 +68,27 @@ def _get_evaluator() -> DescriptionQualityEvaluator:
     return DescriptionQualityEvaluator(
         load_rubric(_rubric_path), manifest.project_dir / "target" / "dbt_doctor"
     )
+
+
+def _database_columns(details: dict[str, Any]) -> tuple[list[ColumnInfo] | None, str | None]:
+    """Describe the model's table in the database. Never raises.
+
+    Returns ``(columns, None)`` on success, or ``(None, reason)`` when the check could not
+    be done, so the review still works without a database connection.
+    """
+    if _connector is None:
+        return None, "database not connected (check profiles.yml); columns were not verified"
+    schema = details.get("schema")
+    table = details.get("alias") or details["name"]
+    if not schema:
+        return None, "the model has no schema in the manifest; columns were not verified"
+    try:
+        columns = _connector.get_table_columns(schema, table)
+    except Exception as exc:
+        return None, f"could not describe {schema}.{table}: {exc}"
+    if not columns:
+        return None, f"table {schema}.{table} was not found in the database"
+    return columns, None
 
 
 def _get_connector() -> BaseConnector:
@@ -174,7 +195,9 @@ def evaluate_model_descriptions(model_name: str, offset: int = 0) -> str:
     Prepare the next batch of columns of ONE model for a description-quality review.
 
     Read-only. Returns the model context, compiled SQL, deterministic signals per column
-    and a scoring rubric. You (the AI assistant) judge each column on each rubric question,
+    and a scoring rubric. When the database is connected it also describes the table, so
+    columns that exist there but are not documented in schema.yml are included (reported
+    as 'missing', `declared: false`) and `database_check` says whether the check ran. You (the AI assistant) judge each column on each rubric question,
     then send the scores with `submit_description_scores`. Wide tables are split into
     batches: keep calling this with `offset=next_offset` until `next_offset` is null.
 
@@ -190,7 +213,8 @@ def evaluate_model_descriptions(model_name: str, offset: int = 0) -> str:
     if not details:
         return f"Model '{model_name}' not found. Run `list_models` to see available models."
     try:
-        batch = _get_evaluator().next_batch(details, offset)
+        db_columns, db_note = _database_columns(details)
+        batch = _get_evaluator().next_batch(details, offset, db_columns=db_columns, db_note=db_note)
     except (RubricError, ValueError) as exc:
         return f"❌ {exc}"
     return json.dumps(batch, ensure_ascii=False)
@@ -201,13 +225,16 @@ def submit_description_scores(model_name: str, scores: list[dict]) -> str:
     """
     Record your scores for a batch from `evaluate_model_descriptions`.
 
-    Each item: {'column': str, 'scores': {<question_id>: <number>}, 'suggested_description': str}.
-    Every rubric question id must be present. `suggested_description` is required when the
-    column's total is below the pass threshold. Invalid input is rejected as a whole.
+    Each item: {'column': str, 'scores': {<question_id>: <number>}}. Every rubric question id
+    must be present. Columns with an empty description are recorded as 'missing' automatically
+    and need no scores (send an empty list if a batch has only those). Invalid input is
+    rejected as a whole. This tool only scores; it never writes or suggests descriptions.
 
     While columns remain it returns progress and the next offset. When every column of the
-    model has been scored it returns the final report: each column with its total, status
-    ('ok' or 'rewrite') and suggested description. This tool does not modify any dbt file.
+    model has been covered it returns the final report: each column with its total (in points,
+    not a percentage) and status: 'ok', 'rewrite' (total below the pass threshold) or
+    'missing' (empty description). `to_update` lists the 'rewrite' and 'missing' columns.
+    This tool does not modify any dbt file.
 
     Args:
         model_name: Exact dbt model name.
@@ -218,7 +245,8 @@ def submit_description_scores(model_name: str, scores: list[dict]) -> str:
     if not details:
         return f"Model '{model_name}' not found. Run `list_models` to see available models."
     try:
-        result = _get_evaluator().submit(details, scores)
+        db_columns, db_note = _database_columns(details)
+        result = _get_evaluator().submit(details, scores, db_columns=db_columns, db_note=db_note)
     except (RubricError, ValueError) as exc:
         return f"❌ {exc}"
     return json.dumps(result, ensure_ascii=False)
