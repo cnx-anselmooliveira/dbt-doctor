@@ -54,6 +54,13 @@ Translate profiling statistics into actionable dbt test recommendations. For exa
 ### Non-Destructive YAML Writing
 Update `schema.yml` files using `ruamel.yaml` to retain hand-written comments, existing tests, and formatting. The tool only appends missing information and preserves your manual configurations.
 
+### Description Quality Review
+Ask your assistant to review the column descriptions of one model, for example: *"Use dbt-doctor to evaluate the descriptions of `fct_orders`."*
+
+dbt-doctor does not call any LLM itself. It hands your assistant the columns, the compiled SQL, a few deterministic hints (empty or repeated descriptions, missing units, complex `CASE`/`COALESCE` logic) and a rubric. The assistant scores every column on every question (0 to 10) and sends the scores back. A column is flagged for rewrite when its total is below `pass_ratio` (70% by default) of the maximum, and comes with a suggested description. Wide tables are processed in batches automatically, and nothing is written to your `schema.yml`.
+
+The default rubric has five questions (not just repeating the column name, explicit unit/format, clear grain, SQL logic reflected, understandable by business users). To change them, copy [description_rubric.json](src/dbt_doctor/description_rubric.json), edit it, and start the server with `--rubric-file /path/to/rubric.json`. The pass threshold follows the number of questions. Run `dbt compile` first so the compiled SQL is available.
+
 ### End-to-End Documentation Generation
 Execute a complete workflow in a single conversational turn: profile a model, suggest tests, preview changes, and write to schema.yml.
 
@@ -69,6 +76,8 @@ Execute a complete workflow in a single conversational turn: profile a model, su
 | Audit | `check_test_coverage` | Models ranked by their test coverage percentage |
 | Audit | `analyze_dag` | Detection of orphan models and high fan-out nodes |
 | Audit | `get_project_health` | Single-call dashboard summarizing project status |
+| Quality | `evaluate_model_descriptions` | Prepares one model's columns, SQL and a scoring rubric for your AI assistant to judge description quality |
+| Quality | `submit_description_scores` | Records the scores, applies the pass threshold and returns which columns need a rewrite |
 | Profiling | `profile_model` | Batched column statistics |
 | Profiling | `execute_query` | Read-only SQL execution against your warehouse |
 | Profiling | `detect_schema_drift` | Comparison of database columns against manifest definitions |

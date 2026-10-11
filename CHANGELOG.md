@@ -5,6 +5,12 @@ All notable changes to `dbt-doctor` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- `evaluate_model_descriptions` and `submit_description_scores` MCP tools: a description-quality review for one model at a time. The client LLM scores each column against an editable rubric (`description_rubric.json`, overridable with `--rubric-file`); dbt-doctor provides the context and deterministic hints, applies the pass threshold and returns the columns to rewrite with suggested descriptions. Wide tables are split into batches automatically. Read-only: nothing is written to the dbt project.
+- `DescriptionQualityEvaluator` analyzer with tests.
+
 ## [0.1.0] - 2025-12-23
 
 ### Added
