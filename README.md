@@ -74,7 +74,19 @@ The same column often gets a different description in each layer even when nothi
 | Pure type cast | Not enforced by default (`--treat-casts-as-passthrough` copies it too) |
 | Lineage not readable (joins, CTEs, unknown Jinja) | Not enforced |
 
-Work from the root layer (bronze) downwards: evaluate a model with `evaluate_model_descriptions`/`submit_description_scores`, run `plan_description_updates` on its children, write, then run `dbt parse` so the manifest reflects the new text. A description's score stops applying as soon as its text changes. Use `dry_run=True` to preview a write. The layer order (`--layer-order`, default `landing,bronze,stg,silver,intermediary,gold|view,az`) only labels and groups models; the dependency graph decides how descriptions propagate.
+Work from the root layer (bronze) downwards: evaluate a model with `evaluate_model_descriptions`/`submit_description_scores`, run `plan_description_updates` on its children, write, then run `dbt parse` so the manifest reflects the new text. A description's score stops applying as soon as its text changes. `update_model_yaml` always updates the file the manifest says documents the model (for example `<model>_schema.yaml`) and never creates a second definition; a model with no YAML gets `<model>_schema.yaml` (`--schema-file-pattern` changes the name). Use `dry_run=True` to preview a write. The layer order (`--layer-order`, default `landing,bronze,stg,silver,intermediary,gold|view,az`) only labels and groups models; the dependency graph decides how descriptions propagate.
+
+### Documentation Campaign (analysis phase)
+Give `start_campaign` a list of tables and drive it with `get_next_work`. Nothing is modified: the campaign only finds out which tables have a problem and builds the work list.
+
+1. Each listed table is **tested**: your assistant scores its descriptions with `evaluate_model_descriptions` and `submit_description_scores`. A column that plainly inherits from a parent whose description passed, with the same text, counts as ok without a score of its own.
+2. A table **passes** when at least `pass_ratio` (70% by default) of its columns are ok. One that fails, by itself or because of its parents, pulls its **parents** into the list; they are tested the same way, one level at a time, until a parent passes or the bronze layer is reached. Sources and landing tables stay in the list as `deferred` and are never processed.
+3. The **direct children** of the listed tables and of the failing parents are added to the list but **not tested** (`children_scope` changes whose children are added). A child is tested only once one of its direct parents has been **updated**, which is detected with a checksum of the parent's descriptions kept in the run; the list then grows one level at a time.
+4. **Nothing is tested twice.** Scores are kept by description text, so a table already scored is never asked for again, and editing a description sends it back to testing.
+
+Statuses: `needs_test`, `passed`, `failed_self`, `blocked_by_parent`, `untested_child`, `deferred`, `skipped`, `error`. They are derived from the evidence on every call; only the membership of the list is persisted (in the run), so it survives restarts (`start_run` with `resume=True`) and only grows. A table asked for repeatedly with no progress becomes `error` after a few requests. When `get_next_work` reports `A_complete`, review the whole list with `get_campaign_status`. Generating the documentation for the list is a later phase and is not available yet.
+
+`get_table_lineage` gives the plain lineage of one table: its parents one level up and every descendant, with the layer, the depth and how its SQL reads.
 
 ### Run History
 Every tool of the documentation flow records what it does into a **run**, in a DuckDB file (`<project>/.dbt-doctor/dbt_doctor.duckdb`, with its own `.gitignore` so nothing reaches your repository). A run opens by itself on first use; `start_run` gives it a goal and a target model, and `start_run(resume=True)` continues the latest open one after a restart or after `dbt parse` changed the manifest.
@@ -110,6 +122,11 @@ Execute a complete workflow in a single conversational turn: profile a model, su
 | Lineage | `plan_description_updates` | For one model, which column descriptions must be copied from the parent, written anew, or are blocked |
 | Lineage | `trace_column_lineage` | Follows a column upstream through the layers |
 | Lineage | `check_description_consistency` | Paged overview of description consistency, parents before children |
+| Campaign | `get_table_lineage` | One table's parents (one level up) and every table below it, as a plain list read from the manifest |
+| Campaign | `start_campaign` | Starts a documentation campaign from a list of tables (phase A: analysis, read-only) |
+| Campaign | `get_next_work` | The next tables the campaign needs tested; recomputes the list from the evidence on every call |
+| Campaign | `get_campaign_status` | The whole campaign list, parents before children, paged |
+| Campaign | `skip_work_item` | Takes a table out of the campaign on purpose |
 | History | `start_run` | Opens a run with a goal and a target model, or resumes the latest open one |
 | History | `get_run_report` | What a run did: events per tool, and per model the columns seen, scores, plan actions and writes |
 | History | `list_runs` | The recorded runs, newest first |

@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Documentation campaign, analysis phase (read-only): `start_campaign`, `get_next_work`, `get_campaign_status` and `skip_work_item`. From a list of tables, it tests them (scores by the client LLM, with columns that plainly inherit from a parent that passed counted as ok), pulls the parents of every failing table into the work list recursively until they pass or the bronze layer is reached, keeps sources and landing tables as `deferred`, adds the direct children without testing them (a child is tested only once a direct parent's descriptions change, detected with a per-table checksum read from the manifest and kept in the work item), and never tests anything twice. The list is persisted in the run (new `work_items` table, schema v2, migrated automatically) and is resumable.
+- `get_table_lineage`: a table's parents one level up and all its descendants, as a plain list from the manifest.
 - Run history in DuckDB (`.dbt-doctor/dbt_doctor.duckdb`): every tool of the documentation flow records into one run, linked by `run_id`: the batches served, description snapshots, scores per question, plan decisions with their reasons, lineage edges and every write (old and new text, copied, skipped or rejected). New `start_run`, `get_run_report` and `list_runs` tools; `--run-store` and `--no-run-store` options. Recording is best-effort and never breaks a tool; one connection per tool call, a score cache for the planner and a cooldown after a failure keep it fast. The JSON score file is imported once.
 - Description consistency across layers, driven by the real dependency graph from `manifest.json` (no `dbt compile` needed):
   - `plan_description_updates`, `trace_column_lineage` and `check_description_consistency` MCP tools. Models are classified from their raw SQL (copy, projection, row-altering effects such as `WHERE`, `GROUP BY`, `DISTINCT`, `UNION`, `LIMIT`; filters inside `is_incremental()` blocks are ignored) and each column is traced to its parent column. The bronze layer is the root; the layer order (`--layer-order`) only labels and groups models.
@@ -24,6 +26,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - `update_model_yaml` now replaces existing column descriptions by default (`overwrite_descriptions=True`) and returns a JSON report (status, file, per-column changes, copied/skipped/rejected columns) instead of a text message. Pass `overwrite_descriptions=False` for the previous fill-only behaviour.
 - The data profiler now treats `tinyint` columns as numeric.
+
+### Fixed
+- `update_model_yaml` created a second YAML file for models already documented in a `<model>_schema.yaml`, which makes dbt fail on a duplicate definition. It now updates the file the manifest points to (`patch_path`), recognises `<model>_schema.yaml` and the usual variants, and refuses to write (asking for `dbt parse`) when that file no longer exists. A model with no YAML gets `<model>_schema.yaml`; `--schema-file-pattern` changes the name.
 
 ## [0.1.0] - 2025-12-23
 
