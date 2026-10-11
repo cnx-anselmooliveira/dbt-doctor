@@ -561,6 +561,7 @@ class DescriptionQualityEvaluator:
                         "description": descriptions[c],
                         "total": e["total"],
                         "status": e["status"],
+                        "scores": e["scores"],
                     }
                     for c, e in scored.items()
                 ],

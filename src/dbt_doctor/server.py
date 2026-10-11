@@ -1,10 +1,11 @@
 """
 dbt-doctor MCP Server — AI-driven quality & governance for dbt projects.
 
-All 17 MCP Tools:
+All 20 MCP Tools:
   Audit:      audit_project, check_test_coverage, analyze_dag, get_project_health
   Quality:    evaluate_model_descriptions, submit_description_scores
   Lineage:    plan_description_updates, trace_column_lineage, check_description_consistency
+  History:    start_run, get_run_report, list_runs
   Profiling:  profile_model, execute_query, detect_schema_drift
   Generation: suggest_tests, update_model_yaml, generate_model_docs
   Context:    list_models, get_model_details
@@ -16,6 +17,8 @@ import argparse
 import json
 import logging
 import sys
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -36,6 +39,8 @@ from .connectors.base import BaseConnector, ColumnInfo
 from .core.manifest import DbtManifestParser
 from .core.profiles import DbtProfileParser
 from .core.project import DbtProjectParser
+from .core.run_recorder import RunRecorder
+from .core.run_store import DEFAULT_RELATIVE_PATH, RunStore
 from .generators.doc_generator import DocGenerator
 from .generators.test_suggester import TestSuggester
 from .generators.yaml_writer import YamlWriter
@@ -56,6 +61,9 @@ _connector: BaseConnector | None = None
 _rubric_path: Path | None = None
 _layer_map: LayerMap = LayerMap()
 _casts_as_passthrough: bool = False
+_run_store_enabled: bool = True
+_run_store_path: Path | None = None
+_recorder: RunRecorder | None = None
 _auditor = ProjectAuditor()
 _dag_analyzer = DagAnalyzer()
 
@@ -67,13 +75,150 @@ def _get_manifest() -> DbtManifestParser:
     return _manifest
 
 
+def _run_context() -> dict[str, Any]:
+    """What a new run records about its environment."""
+    manifest_info: dict[str, Any] = {}
+    if _manifest is not None:
+        meta = (_manifest.get_raw().get("metadata") or {}) if _manifest else {}
+        try:
+            mtime = _manifest.manifest_path.stat().st_mtime
+        except OSError:
+            mtime = None
+        manifest_info = {
+            "path": str(_manifest.manifest_path),
+            "mtime": mtime,
+            "generated_at": meta.get("generated_at"),
+            "invocation_id": meta.get("invocation_id"),
+            "project_name": meta.get("project_name"),
+        }
+    try:
+        fingerprint = load_rubric(_rubric_path).fingerprint()
+    except Exception:
+        fingerprint = ""
+    params = {"layer_order": _layer_map.order, "casts_as_passthrough": _casts_as_passthrough}
+    return {"manifest": manifest_info, "rubric_fp": fingerprint, "params": params}
+
+
+def _get_recorder() -> RunRecorder | None:
+    """The run recorder of the current project, or None when the run store is disabled."""
+    global _recorder
+    if not _run_store_enabled:
+        return None
+    project_dir = _get_manifest().project_dir
+    path = _run_store_path or project_dir / DEFAULT_RELATIVE_PATH
+    if _recorder is None or _recorder.store.path != path:
+        _recorder = RunRecorder(RunStore(path), _run_context)
+        _recorder.import_legacy_scores(project_dir / "target" / "dbt_doctor" / STORE_FILENAME)
+    return _recorder
+
+
+def _score_store() -> Any:
+    """Where scores live: the run store, or the legacy JSON file when it is disabled."""
+    recorder = _get_recorder()
+    if recorder is not None:
+        return recorder
+    return ScoreStore(_get_manifest().project_dir / "target" / "dbt_doctor" / STORE_FILENAME)
+
+
+class _NoEvent:
+    ok = True
+
+    def __init__(self) -> None:
+        self.summary: dict[str, Any] = {}
+
+
+@contextmanager
+def _flow_event(tool: str, model: str | None) -> Iterator[tuple[RunRecorder | None, Any]]:
+    """Wrap a tool call so what it records is linked to one event of the current run."""
+    recorder = _get_recorder()
+    if recorder is None:
+        yield None, _NoEvent()
+    else:
+        with recorder.event(tool, model) as event:
+            yield recorder, event
+
+
+def _descriptions(details: dict[str, Any]) -> dict[str, str]:
+    return {c: (d.get("description") or "") for c, d in details.get("columns", {}).items()}
+
+
+def _edges_from_upstream(upstream: dict[str, dict] | None) -> list[dict[str, Any]]:
+    return [
+        {
+            "column": column,
+            "parent": info.get("parent"),
+            "parent_column": info.get("parent_column"),
+            "kind": info.get("kind"),
+            "effects": info.get("model_effects"),
+            "confidence": "low" if info.get("kind") == "unknown" else "high",
+            "evidence": (info.get("built_by") or {}).get("expression") or info.get("why"),
+        }
+        for column, info in (upstream or {}).items()
+    ]
+
+
+def _edges_from_plan(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    edges = []
+    for e in entries:
+        lineage = e.get("lineage")
+        if not lineage:
+            continue
+        edges.append(
+            {
+                "column": e["column"],
+                "parent": lineage.get("parent"),
+                "parent_column": lineage.get("parent_column"),
+                "kind": lineage.get("kind"),
+                "effects": lineage.get("effects"),
+                "confidence": "low" if lineage.get("kind") == "unknown" else "high",
+                "evidence": lineage.get("evidence"),
+            }
+        )
+    return edges
+
+
+def _write_rows(
+    model_name: str, result: dict[str, Any], report: dict[str, list], dry_run: bool
+) -> list[dict[str, Any]]:
+    copied = {c["column"].lower() for c in report["copied"]}
+    file_path = result["file_path"]
+    rows: list[dict[str, Any]] = []
+    for change in result["changes"]:
+        column = change.get("column")
+        rows.append(
+            {
+                "model": model_name,
+                "scope": change["scope"],
+                "column": column,
+                "file_path": file_path,
+                "action": "changed",
+                "via": "copy" if column and column.lower() in copied else "supplied",
+                "old": change.get("old"),
+                "new": change.get("new"),
+                "dry_run": dry_run,
+            }
+        )
+    for action, key in (("skipped", "skipped"), ("rejected", "rejected")):
+        for item in report[key]:
+            rows.append(
+                {
+                    "model": model_name,
+                    "scope": "column",
+                    "column": item["column"],
+                    "file_path": file_path,
+                    "action": action,
+                    "reason": item["reason"],
+                    "dry_run": dry_run,
+                }
+            )
+    return rows
+
+
 def _get_evaluator() -> DescriptionQualityEvaluator:
     manifest = _get_manifest()
     # Reloaded on every call so edits to the rubric file apply without restarting the server.
     state_dir = manifest.project_dir / "target" / "dbt_doctor"
-    return DescriptionQualityEvaluator(
-        load_rubric(_rubric_path), state_dir, ScoreStore(state_dir / STORE_FILENAME)
-    )
+    return DescriptionQualityEvaluator(load_rubric(_rubric_path), state_dir, _score_store())
 
 
 def _upstream(model_name: str) -> dict[str, dict] | None:
@@ -87,12 +232,9 @@ def _upstream(model_name: str) -> dict[str, dict] | None:
 
 def _get_planner() -> LineagePlanner:
     manifest = _get_manifest()
-    state_dir = manifest.project_dir / "target" / "dbt_doctor"
     graph = LineageGraph(manifest.get_raw(), _layer_map)
     fingerprint = load_rubric(_rubric_path).fingerprint()
-    return LineagePlanner(
-        graph, ScoreStore(state_dir / STORE_FILENAME), fingerprint, _casts_as_passthrough
-    )
+    return LineagePlanner(graph, _score_store(), fingerprint, _casts_as_passthrough)
 
 
 def _database_columns(details: dict[str, Any]) -> tuple[list[ColumnInfo] | None, str | None]:
@@ -220,16 +362,20 @@ def evaluate_model_descriptions(model_name: str, offset: int = 0) -> str:
     Prepare the next batch of columns of ONE model for a description-quality review.
 
     Read-only. Returns the model context, compiled SQL, deterministic signals per column
-    and a scoring rubric. Each column also carries its `upstream` context when it can be
-    read: the parent model and column, how it is built (passthrough, renamed, cast,
-    transformed), the parent's description and the expression that builds it. When the database is connected it also describes the table, so
-    columns that exist there but are not documented in schema.yml are included (reported
-    as 'missing', `declared: false`) and `database_check` says whether the check ran. You (the AI assistant) judge each column on each rubric question,
-    then send the scores with `submit_description_scores`. Wide tables are split into
-    batches: keep calling this with `offset=next_offset` until `next_offset` is null.
+    and a scoring rubric. You (the AI assistant) judge each column on each rubric question,
+    then send the scores with `submit_description_scores`.
 
-    Start a new evaluation with offset=0 (this discards any unfinished evaluation of the
-    same model). Requires `dbt compile` so the compiled SQL is available.
+    Each column also carries its `upstream` context when it can be read: the parent model
+    and column, how it is built (passthrough, renamed, cast, transformed), the parent's
+    description and the expression that builds it. When the database is connected the
+    table is described too, so columns that exist there but are not documented in
+    schema.yml are included (reported as 'missing', `declared: false`), and
+    `database_check` says whether the check ran.
+
+    Wide tables are split into batches: keep calling this with `offset=next_offset` until
+    `next_offset` is null. Start a new evaluation with offset=0 (this discards any
+    unfinished evaluation of the same model). Requires `dbt compile` for the compiled SQL.
+    What it serves is recorded in the current run (`run` in the result).
 
     Args:
         model_name: Exact dbt model name.
@@ -239,13 +385,29 @@ def evaluate_model_descriptions(model_name: str, offset: int = 0) -> str:
     details = parser.get_model_details(model_name)
     if not details:
         return f"Model '{model_name}' not found. Run `list_models` to see available models."
-    try:
-        db_columns, db_note = _database_columns(details)
-        batch = _get_evaluator().next_batch(
-            details, offset, db_columns=db_columns, db_note=db_note, upstream=_upstream(model_name)
-        )
-    except (RubricError, ValueError) as exc:
-        return f"❌ {exc}"
+    with _flow_event("evaluate_model_descriptions", model_name) as (recorder, event):
+        try:
+            db_columns, db_note = _database_columns(details)
+            upstream = _upstream(model_name)
+            batch = _get_evaluator().next_batch(
+                details, offset, db_columns=db_columns, db_note=db_note, upstream=upstream
+            )
+        except (RubricError, ValueError) as exc:
+            event.ok = False
+            event.summary["error"] = str(exc)
+            return f"❌ {exc}"
+        if recorder is not None:
+            event.summary.update(
+                offset=offset,
+                total_columns=batch["total_columns"],
+                returned=len(batch["columns"]),
+                next_offset=batch["next_offset"],
+                database_check=batch["database_check"]["status"],
+                upstream_columns=len(upstream or {}),
+            )
+            recorder.record_snapshot(model_name, _descriptions(details))
+            recorder.record_lineage(model_name, _edges_from_upstream(upstream))
+            batch["run"] = recorder.info()
     return json.dumps(batch, ensure_ascii=False)
 
 
@@ -263,7 +425,7 @@ def submit_description_scores(model_name: str, scores: list[dict]) -> str:
     model has been covered it returns the final report: each column with its total (in points,
     not a percentage) and status: 'ok', 'rewrite' (total below the pass threshold) or
     'missing' (empty description). `to_update` lists the 'rewrite' and 'missing' columns.
-    This tool does not modify any dbt file.
+    The scores are recorded in the current run. This tool does not modify any dbt file.
 
     Args:
         model_name: Exact dbt model name.
@@ -273,11 +435,22 @@ def submit_description_scores(model_name: str, scores: list[dict]) -> str:
     details = parser.get_model_details(model_name)
     if not details:
         return f"Model '{model_name}' not found. Run `list_models` to see available models."
-    try:
-        db_columns, db_note = _database_columns(details)
-        result = _get_evaluator().submit(details, scores, db_columns=db_columns, db_note=db_note)
-    except (RubricError, ValueError) as exc:
-        return f"❌ {exc}"
+    with _flow_event("submit_description_scores", model_name) as (recorder, event):
+        try:
+            db_columns, db_note = _database_columns(details)
+            result = _get_evaluator().submit(
+                details, scores, db_columns=db_columns, db_note=db_note
+            )
+        except (RubricError, ValueError) as exc:
+            event.ok = False
+            event.summary["error"] = str(exc)
+            return f"❌ {exc}"
+        if recorder is not None:
+            keys = ("status", "evaluated", "total_columns", "summary")
+            event.summary.update({k: result[k] for k in keys if k in result})
+            if "to_update" in result:
+                event.summary["to_update"] = len(result["to_update"])
+            result["run"] = recorder.info()
     return json.dumps(result, ensure_ascii=False)
 
 
@@ -303,14 +476,30 @@ def plan_description_updates(model_name: str) -> str:
 
     Work models from the root layer (bronze) downwards. `update_model_yaml` enforces the
     same rules when writing. Run `dbt parse` after writing so the manifest reflects it.
+    The plan is recorded in the current run.
 
     Args:
         model_name: Exact dbt model name.
     """
-    try:
-        return json.dumps(_get_planner().plan_model(model_name), ensure_ascii=False)
-    except (RubricError, ValueError) as exc:
-        return f"❌ {exc}"
+    parser = _get_manifest()
+    with _flow_event("plan_description_updates", model_name) as (recorder, event):
+        try:
+            plan = _get_planner().plan_model(model_name)
+        except (RubricError, ValueError) as exc:
+            event.ok = False
+            event.summary["error"] = str(exc)
+            return f"❌ {exc}"
+        if recorder is not None:
+            event.summary.update(
+                layer=plan["layer"], summary=plan["summary"], blocked_by=plan["blocked_by"]
+            )
+            details = parser.get_model_details(model_name)
+            if details:
+                recorder.record_snapshot(model_name, _descriptions(details))
+            recorder.record_plan(model_name, plan["columns"])
+            recorder.record_lineage(model_name, _edges_from_plan(plan["columns"]))
+            plan["run"] = recorder.info()
+    return json.dumps(plan, ensure_ascii=False)
 
 
 @mcp.tool()
@@ -347,11 +536,98 @@ def check_description_consistency(layer: str = "", offset: int = 0, limit: int =
         offset: Index of the first model of the page.
         limit: Models per page.
     """
-    try:
-        report = _get_planner().consistency(layer, max(offset, 0), max(1, min(limit, 200)))
-    except (RubricError, ValueError) as exc:
-        return f"❌ {exc}"
+    with _flow_event("check_description_consistency", None) as (recorder, event):
+        try:
+            report = _get_planner().consistency(layer, max(offset, 0), max(1, min(limit, 200)))
+        except (RubricError, ValueError) as exc:
+            event.ok = False
+            event.summary["error"] = str(exc)
+            return f"❌ {exc}"
+        if recorder is not None:
+            event.summary.update(
+                layer=report["layer"],
+                total_models=report["total_models"],
+                totals=report["totals"],
+                offset=report["offset"],
+            )
+            report["run"] = recorder.info()
     return json.dumps(report, ensure_ascii=False)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# RUN HISTORY TOOLS
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+@mcp.tool()
+def start_run(goal: str = "", target_model: str = "", resume: bool = False) -> str:
+    """
+    Open a run with an explicit context, or resume the latest open one.
+
+    Every tool of the documentation flow records what it does (batches served, scores,
+    plans, writes) into the current run, so the whole campaign can be reviewed later with
+    `get_run_report`. A run opens by itself on first use; call this to give it a goal and a
+    target model, or with `resume=True` to continue the latest open run (for the same
+    target model, if given) after a restart or after `dbt parse` changed the manifest.
+    Starting a new run closes the previous open ones.
+
+    Args:
+        goal: What this campaign is for, in your own words.
+        target_model: The model the campaign is about (optional).
+        resume: Continue the latest open run instead of starting a new one.
+    """
+    _get_manifest()
+    recorder = _get_recorder()
+    if recorder is None:
+        return "The run store is disabled (--no-run-store); nothing is being recorded."
+    return json.dumps(recorder.start_run(goal, target_model, resume), ensure_ascii=False)
+
+
+@mcp.tool()
+def get_run_report(run_id: str = "") -> str:
+    """
+    Summary of one run: what each tool did, per model (columns seen, scores, plan actions,
+    writes), the most common blocking reasons and the latest events.
+
+    Args:
+        run_id: The run to report (empty = the current run).
+    """
+    _get_manifest()
+    recorder = _get_recorder()
+    if recorder is None:
+        return "The run store is disabled (--no-run-store); nothing is being recorded."
+    target = run_id or recorder.run_id
+    if not target:
+        return "No run yet. Use a flow tool or `start_run` first."
+    try:
+        report = recorder.store.run_report(target)
+    except Exception as exc:
+        return f"❌ Could not read the run store: {exc}"
+    if report is None:
+        return f"Run '{target}' not found. Use `list_runs` to see the available runs."
+    return json.dumps(report, ensure_ascii=False, default=str)
+
+
+@mcp.tool()
+def list_runs(limit: int = 20) -> str:
+    """
+    List the recorded runs, newest first: status, goal, target model, number of events and
+    of models touched.
+
+    Args:
+        limit: Maximum number of runs to list.
+    """
+    _get_manifest()
+    recorder = _get_recorder()
+    if recorder is None:
+        return "The run store is disabled (--no-run-store); nothing is being recorded."
+    try:
+        runs = recorder.store.list_runs(limit)
+    except Exception as exc:
+        return f"❌ Could not read the run store: {exc}"
+    return json.dumps(
+        {"current_run": recorder.run_id, "runs": runs}, ensure_ascii=False, default=str
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -724,7 +1000,8 @@ def update_model_yaml(
     - with `apply_copies`, columns that must be copied are copied even if not sent.
 
     Use `dry_run=True` to preview the changes without writing. Run `dbt parse` after
-    writing so the manifest reflects the new descriptions.
+    writing so the manifest reflects the new descriptions. Every change (old and new text,
+    copied, skipped or rejected) is recorded in the current run.
 
     Args:
         model_name: Exact dbt model name (e.g. 'stg_orders').
@@ -744,38 +1021,53 @@ def update_model_yaml(
     if not model_path:
         return f"Could not determine SQL file path for '{model_name}'."
 
-    try:
-        to_write, report = _get_planner().enforce(model_name, columns, apply_copies)
-    except (RubricError, ValueError) as exc:
-        return f"❌ {exc}"
+    with _flow_event("update_model_yaml", model_name) as (recorder, event):
+        try:
+            to_write, report = _get_planner().enforce(model_name, columns, apply_copies)
+        except (RubricError, ValueError) as exc:
+            event.ok = False
+            event.summary["error"] = str(exc)
+            return f"❌ {exc}"
+        if recorder is not None:  # the state before this run changes anything
+            recorder.record_snapshot(model_name, _descriptions(details))
 
-    project_dir = _manifest.project_dir if _manifest else Path(".")
-    writer = YamlWriter(str(project_dir))
+        project_dir = _manifest.project_dir if _manifest else Path(".")
+        writer = YamlWriter(str(project_dir))
 
-    result = writer.upsert_model_yaml(
-        model_name=model_name,
-        model_sql_path=model_path,
-        description=description,
-        columns=to_write,
-        overwrite_descriptions=overwrite_descriptions,
-        dry_run=dry_run,
-    )
+        result = writer.upsert_model_yaml(
+            model_name=model_name,
+            model_sql_path=model_path,
+            description=description,
+            columns=to_write,
+            overwrite_descriptions=overwrite_descriptions,
+            dry_run=dry_run,
+        )
 
-    if "error" in result:
-        return f"❌ Failed to update YAML: {result['error']}"
+        if "error" in result:
+            event.ok = False
+            event.summary["error"] = result["error"]
+            return f"❌ Failed to update YAML: {result['error']}"
 
-    return json.dumps(
-        {
+        payload = {
             "status": "dry_run" if dry_run else "written",
             "model": model_name,
             "file": result["file_path"],
             "changes": result["changes"],
             **report,
             "next_step": None if dry_run else "Run `dbt parse` to refresh the manifest.",
-        },
-        ensure_ascii=False,
-        default=str,
-    )
+        }
+        if recorder is not None:
+            event.summary.update(
+                status=payload["status"],
+                changed=len(result["changes"]),
+                copied=len(report["copied"]),
+                skipped=len(report["skipped"]),
+                rejected=len(report["rejected"]),
+                file=result["file_path"],
+            )
+            recorder.record_writes(_write_rows(model_name, result, report, dry_run))
+            payload["run"] = recorder.info()
+    return json.dumps(payload, ensure_ascii=False, default=str)
 
 
 @mcp.tool()
@@ -944,14 +1236,32 @@ def main() -> None:
         ),
     )
 
+    arg_parser.add_argument(
+        "--run-store",
+        type=str,
+        default=None,
+        help=(
+            "Path of the DuckDB file that records every run "
+            "(default: <project>/.dbt-doctor/dbt_doctor.duckdb)."
+        ),
+    )
+    arg_parser.add_argument(
+        "--no-run-store",
+        action="store_true",
+        help="Do not record runs; scores fall back to a JSON file under target/dbt_doctor/.",
+    )
+
     args, _ = arg_parser.parse_known_args()
 
     # Configure logging
     logging.getLogger().setLevel(getattr(logging, args.log_level))
 
     global _manifest, _connector, _rubric_path, _layer_map, _casts_as_passthrough
+    global _run_store_enabled, _run_store_path
 
     _casts_as_passthrough = args.treat_casts_as_passthrough
+    _run_store_enabled = not args.no_run_store
+    _run_store_path = Path(args.run_store) if args.run_store else None
 
     try:
         _layer_map = LayerMap(args.layer_order)
@@ -977,7 +1287,7 @@ def main() -> None:
 
     _connector = _build_connector(project_dir)
     if _connector:
-        logger.info("DB connected — all 17 tools available.")
+        logger.info("DB connected — all 20 tools available.")
     else:
         logger.info(
             "DB not connected — profiling/drift tools unavailable. "
