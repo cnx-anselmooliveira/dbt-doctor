@@ -69,6 +69,10 @@ class DbtManifestParser:
     def _data(self) -> dict[str, Any]:
         return self._cache.data
 
+    def get_raw(self) -> dict[str, Any]:
+        """The parsed manifest.json as loaded (read-only use)."""
+        return self._cache.data
+
     def _build_test_index(self) -> dict[str, dict[str, list[str]]]:
         """Map each model's unique_id to its tests.
 
