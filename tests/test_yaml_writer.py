@@ -111,3 +111,85 @@ models:
     content = Path(result["file_path"]).read_text()
     assert "order_id" in content  # old column preserved
     assert "status" in content  # new column added
+
+
+# ── overwrite and dry run ─────────────────────────────────────────────────
+
+EXISTING_YAML = """\
+version: 2
+
+models:
+  - name: fct_orders
+    description: Old model text
+    columns:
+      # keep this comment
+      - name: order_id
+        description: Old order id text
+        tests:
+          - not_null
+      - name: status
+        description: ""
+"""
+
+
+def _project_with_yaml(tmp_path):
+    models_dir = tmp_path / "models"
+    models_dir.mkdir()
+    (models_dir / "fct_orders.sql").write_text("SELECT 1")
+    yaml_file = models_dir / "_fct_orders.yml"
+    yaml_file.write_text(EXISTING_YAML, encoding="utf-8")
+    return YamlWriter(str(tmp_path)), yaml_file
+
+
+def _upsert(writer, **kwargs):
+    return writer.upsert_model_yaml(
+        model_name="fct_orders",
+        model_sql_path="models/fct_orders.sql",
+        columns=[
+            {"name": "order_id", "description": "New order id text", "tests": ["unique"]},
+            {"name": "status", "description": "Order status"},
+            {"name": "amount", "description": "Order amount"},
+        ],
+        **kwargs,
+    )
+
+
+def test_existing_descriptions_are_kept_by_default_and_empty_ones_filled(tmp_path):
+    writer, yaml_file = _project_with_yaml(tmp_path)
+    result = _upsert(writer)
+    content = yaml_file.read_text(encoding="utf-8")
+    assert "Old order id text" in content and "New order id text" not in content
+    assert "Order status" in content and "Order amount" in content
+    assert {c["column"] for c in result["changes"]} == {"status", "amount"}
+
+
+def test_overwrite_replaces_existing_descriptions_and_keeps_tests_and_comments(tmp_path):
+    writer, yaml_file = _project_with_yaml(tmp_path)
+    result = _upsert(writer, overwrite_descriptions=True)
+    content = yaml_file.read_text(encoding="utf-8")
+    assert "New order id text" in content and "Old order id text" not in content
+    assert "# keep this comment" in content
+    assert "not_null" in content and "unique" in content  # tests are only ever added
+    change = next(c for c in result["changes"] if c["column"] == "order_id")
+    assert (change["old"], change["new"]) == ("Old order id text", "New order id text")
+    assert result["dry_run"] is False
+
+
+def test_dry_run_reports_changes_without_touching_the_file(tmp_path):
+    writer, yaml_file = _project_with_yaml(tmp_path)
+    result = _upsert(writer, overwrite_descriptions=True, dry_run=True)
+    assert yaml_file.read_text(encoding="utf-8") == EXISTING_YAML
+    assert result["dry_run"] is True and len(result["changes"]) == 3
+
+
+def test_identical_text_is_not_reported_as_a_change(tmp_path):
+    writer, _ = _project_with_yaml(tmp_path)
+    result = writer.upsert_model_yaml(
+        model_name="fct_orders",
+        model_sql_path="models/fct_orders.sql",
+        description="Old  model text",
+        columns=[{"name": "order_id", "description": "Old order id\ntext"}],
+        overwrite_descriptions=True,
+        dry_run=True,
+    )
+    assert result["changes"] == []
