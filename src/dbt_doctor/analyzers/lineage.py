@@ -121,6 +121,7 @@ class LineageGraph:
                 c: (d.get("description") or "") for c, d in (src.get("columns") or {}).items()
             }
         self.by_name = {m.name: uid for uid, m in self.models.items()}
+        self._children: dict[str, list[str]] | None = None
 
     # ── model level ───────────────────────────────────────────────────────
 
@@ -128,6 +129,48 @@ class LineageGraph:
         if uid not in self._shapes:
             self._shapes[uid] = analyze_sql(self.models[uid].raw_code)
         return self._shapes[uid]
+
+    def child_models(self, uid: str) -> list[str]:
+        """Models that directly depend on ``uid``, by name."""
+        if self._children is None:
+            children: dict[str, list[str]] = {u: [] for u in self.models}
+            for child in self.models:
+                for parent in self.parent_models(child):
+                    children[parent].append(child)
+            for kids in children.values():
+                kids.sort(key=lambda u: self.models[u].name)
+            self._children = children
+        return self._children.get(uid, [])
+
+    def descendants(self, uid: str, max_depth: int | None = None) -> dict[str, int]:
+        """Every model below ``uid`` with its distance (1 = direct child)."""
+        depth: dict[str, int] = {}
+        queue = [(uid, 0)]
+        while queue:
+            current, level = queue.pop(0)
+            if max_depth is not None and level >= max_depth:
+                continue
+            for child in self.child_models(current):
+                if child not in depth and child != uid:
+                    depth[child] = level + 1
+                    queue.append((child, level + 1))
+        return depth
+
+    def parent_entries(self, uid: str) -> list[dict[str, str]]:
+        """The direct parents of a model: models and also sources, seeds and snapshots."""
+        entries = []
+        for parent in self.models[uid].parents:
+            if parent in self.models:
+                model = self.models[parent]
+                entries.append(
+                    {"uid": parent, "name": model.name, "kind": "model", "layer": model.layer}
+                )
+            else:
+                kind = parent.split(".", 1)[0]
+                entries.append(
+                    {"uid": parent, "name": parent.split(".", 2)[-1], "kind": kind, "layer": kind}
+                )
+        return sorted(entries, key=lambda e: e["name"])
 
     def parent_models(self, uid: str) -> list[str]:
         return [p for p in self.models[uid].parents if p in self.models]

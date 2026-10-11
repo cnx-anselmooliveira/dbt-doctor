@@ -26,7 +26,7 @@ import duckdb
 
 from ..analyzers.score_store import description_hash
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 DEFAULT_RELATIVE_PATH = Path(".dbt-doctor") / "dbt_doctor.duckdb"
 
 
@@ -70,6 +70,11 @@ _SCHEMA = [
         run_id VARCHAR, model VARCHAR, column_name VARCHAR, parent_model VARCHAR,
         parent_column VARCHAR, kind VARCHAR, effects VARCHAR, confidence VARCHAR,
         evidence VARCHAR, PRIMARY KEY (run_id, model, column_name))""",
+    """CREATE TABLE IF NOT EXISTS work_items (
+        run_id VARCHAR, model VARCHAR, role VARCHAR, depth INTEGER, discovered_from VARCHAR,
+        status VARCHAR, reason VARCHAR, layer VARCHAR, ratio DOUBLE, summary_json VARCHAR,
+        attempts INTEGER, first_seen TIMESTAMP, updated_at TIMESTAMP,
+        PRIMARY KEY (run_id, model))""",
     """CREATE OR REPLACE VIEW v_latest_scores AS
         SELECT * EXCLUDE (rn) FROM (
             SELECT *, row_number() OVER (
@@ -157,7 +162,12 @@ class RunStore:
             raise StoreUnavailable(
                 f"{self.path.name} was created by a newer dbt-doctor (schema {row[0]})."
             )
-        # Future versions: apply migrations from int(row[0]) up to SCHEMA_VERSION here.
+        elif int(row[0]) < SCHEMA_VERSION:
+            # v1 -> v2 only adds the work_items table, created above with IF NOT EXISTS.
+            # Later versions: apply their changes here, in order, before the bump.
+            conn.execute(
+                "UPDATE meta SET value = ? WHERE key = 'schema_version'", [str(SCHEMA_VERSION)]
+            )
 
     def query(self, sql: str, params: Sequence[Any] = ()) -> list[dict[str, Any]]:
         with self.connection() as conn:
@@ -447,6 +457,47 @@ class RunStore:
                 ],
             )
 
+    # ── campaign work items ───────────────────────────────────────────────
+
+    def upsert_work_items(self, run_id: str, items: list[dict[str, Any]]) -> None:
+        """Insert or update items. ``first_seen`` is kept; ``attempts`` is taken as given."""
+        if not items:
+            return
+        now = utcnow()
+        with self.connection() as conn:
+            conn.executemany(
+                "INSERT INTO work_items VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT (run_id, model) DO UPDATE SET role = excluded.role, "
+                "depth = excluded.depth, status = excluded.status, reason = excluded.reason, "
+                "layer = excluded.layer, ratio = excluded.ratio, "
+                "summary_json = excluded.summary_json, attempts = excluded.attempts, "
+                "updated_at = excluded.updated_at",
+                [
+                    (
+                        run_id,
+                        i["model"],
+                        i["role"],
+                        i.get("depth"),
+                        i.get("discovered_from"),
+                        i["status"],
+                        i.get("reason"),
+                        i.get("layer"),
+                        i.get("ratio"),
+                        json.dumps(i.get("summary") or {}, default=str),
+                        i.get("attempts", 0),
+                        now,
+                        now,
+                    )
+                    for i in items
+                ],
+            )
+
+    def load_work_items(self, run_id: str) -> list[dict[str, Any]]:
+        rows = self.query("SELECT * FROM work_items WHERE run_id = ?", [run_id])
+        for row in rows:
+            row["summary"] = json.loads(row.pop("summary_json") or "{}")
+        return rows
+
     # ── reports ───────────────────────────────────────────────────────────
 
     def list_runs(self, limit: int = 20) -> list[dict[str, Any]]:
@@ -510,6 +561,11 @@ class RunStore:
             key = f"{row['action']}{' (dry run)' if row['dry_run'] else ''}"
             entry(row["model"]).setdefault("writes", {})[key] = row["n"]
 
+        campaign = self.query(
+            "SELECT status, count(*) AS n FROM work_items WHERE run_id = ? "
+            "GROUP BY status ORDER BY n DESC",
+            [run_id],
+        )
         blocked = self.query(
             "SELECT reason, count(*) AS n FROM ("
             " SELECT *, row_number() OVER (PARTITION BY model, lower(column_name) "
@@ -521,6 +577,7 @@ class RunStore:
             "run": run,
             "events_by_tool": events,
             "models": sorted(models.values(), key=lambda m: m["model"]),
+            "campaign": {r["status"]: r["n"] for r in campaign},
             "top_blocked_reasons": blocked,
             "latest_events": last_events,
         }

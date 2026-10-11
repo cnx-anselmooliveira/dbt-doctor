@@ -371,3 +371,56 @@ def test_scores_are_read_once_per_tool_call_and_refreshed_when_new_ones_arrive(s
         assert recorder.lookup("m", "b", "t2", "fp")["status"] == "rewrite"  # sees the new score
         assert len(reads) == 2
     assert recorder.lookup("m", "a", "text", "fp")["status"] == "ok"  # outside a call: direct read
+
+
+# ── schema migration ──────────────────────────────────────────────────────
+
+
+def test_a_version_1_database_is_migrated_to_the_current_schema(tmp_path):
+    import duckdb
+
+    path = tmp_path / "old.duckdb"
+    conn = duckdb.connect(str(path))
+    conn.execute("CREATE TABLE meta (key VARCHAR PRIMARY KEY, value VARCHAR)")
+    conn.execute("INSERT INTO meta VALUES ('schema_version', '1')")
+    conn.execute(
+        "CREATE TABLE runs (run_id VARCHAR PRIMARY KEY, started_at TIMESTAMP, ended_at TIMESTAMP, "
+        "status VARCHAR, goal VARCHAR, target_model VARCHAR, manifest_id VARCHAR, "
+        "rubric_fp VARCHAR, params_json VARCHAR)"
+    )
+    conn.execute(
+        "INSERT INTO runs VALUES ('old_run', now(), NULL, 'open', 'g', '', NULL, 'fp', '{}')"
+    )
+    conn.close()
+
+    store = RunStore(path)
+    assert store.query("SELECT value FROM meta WHERE key = 'schema_version'") == [
+        {"value": str(SCHEMA_VERSION)}
+    ]
+    assert store.get_run("old_run")["goal"] == "g"  # existing data is kept
+    store.upsert_work_items("old_run", [{"model": "m", "role": "seed", "status": "needs_test"}])
+    assert store.load_work_items("old_run")[0]["status"] == "needs_test"
+
+
+def test_work_items_keep_their_first_seen_time_and_update_in_place(store):
+    run = store.create_run("g", "", None, "fp", {})
+    store.upsert_work_items(
+        run, [{"model": "m", "role": "seed", "status": "needs_test", "depth": 0}]
+    )
+    first = store.load_work_items(run)[0]
+    store.upsert_work_items(
+        run,
+        [
+            {
+                "model": "m",
+                "role": "seed",
+                "status": "passed",
+                "depth": 0,
+                "ratio": 1.0,
+                "summary": {"a": 1},
+            }
+        ],
+    )
+    rows = store.load_work_items(run)
+    assert len(rows) == 1 and rows[0]["status"] == "passed" and rows[0]["summary"] == {"a": 1}
+    assert rows[0]["first_seen"] == first["first_seen"]

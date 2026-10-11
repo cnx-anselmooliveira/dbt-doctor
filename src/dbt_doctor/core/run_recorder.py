@@ -84,11 +84,14 @@ class RunRecorder:
 
     # ── runs ──────────────────────────────────────────────────────────────
 
-    def _new_run(self, goal: str, target_model: str) -> str:
+    def _new_run(
+        self, goal: str, target_model: str, extra_params: dict[str, Any] | None = None
+    ) -> str:
         ctx = self._context()
         manifest_id = self._manifest_id()
+        params = {**(ctx.get("params") or {}), **(extra_params or {})}
         run_id = self.store.create_run(
-            goal, target_model, manifest_id, ctx.get("rubric_fp", ""), ctx.get("params") or {}
+            goal, target_model, manifest_id, ctx.get("rubric_fp", ""), params
         )
         self.store.close_open_runs(except_run=run_id)
         self.run_id = run_id
@@ -101,7 +104,11 @@ class RunRecorder:
         return self.run_id
 
     def start_run(
-        self, goal: str = "", target_model: str = "", resume: bool = False
+        self,
+        goal: str = "",
+        target_model: str = "",
+        resume: bool = False,
+        params: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Open a run with an explicit context, or resume the latest open one."""
         result: dict[str, Any] = {"resumed": False, "manifest_changed": False}
@@ -114,7 +121,7 @@ class RunRecorder:
                     result["resumed"] = True
                     result["manifest_changed"] = run.get("manifest_id") != self._manifest_id()
                     return
-            self._new_run(goal or "(no goal given)", target_model)
+            self._new_run(goal or "(no goal given)", target_model, params)
 
         self._safe(go)
         result.update(self.info())
